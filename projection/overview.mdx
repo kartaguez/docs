@@ -1,7 +1,7 @@
 ---
 title: "Balance Projection Pipeline: How Pocoma Computes Balances"
 sidebarTitle: "Overview"
-description: "Pocoma computes pot balances asynchronously through a durable two-stage pipeline: a task builder coalesces business events, and a task executor runs the balance calculator."
+description: "Pocoma computes pot balances asynchronously via a durable two-stage pipeline: task builder coalesces outbox events, task executor runs the calculator."
 ---
 
 ## Why Asynchronous?

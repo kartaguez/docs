@@ -1,7 +1,7 @@
 ---
 title: "Supra Layer: HTTP, Workers, and Technology Adapters"
 sidebarTitle: "Supra"
-description: "The supra modules wire external-facing technology: REST controllers, projection worker dispatchers, and NATS messaging adapters."
+description: "The supra modules wire external-facing technology: REST controllers, projection worker dispatchers, and NATS messaging adapters for Pocoma."
 ---
 
 The supra layer is the outermost ring of Pocoma's hexagonal architecture. It contains all inbound adapters: the HTTP API that translates REST requests into engine commands and queries, and the worker dispatchers that poll durable outbox tables and drive the asynchronous projection pipeline. Supra modules may import Spring, NATS, and other technology libraries freely; the engine and domain modules never depend on them.
@@ -14,7 +14,7 @@ Supra modules call inbound port interfaces defined in the engine. They never imp
 
 ## Module layout
 
-```
+```text
 app/
   supra-http-rest-spring/                         REST controllers, DTOs, mappers, error handling
   supra-dispatcher-business-events-outbox-nats/   NATS-backed task builder worker (stage 1)
@@ -91,7 +91,7 @@ Request DTOs live in `dto/request` and response DTOs in `dto/response`. All DTO 
 |---|---|
 | `InvalidRequestException` | `400 Bad Request` |
 | `MissingRequestHeaderException` | `400 Bad Request` |
-| `IllegalArgumentException`, `NullPointerException`, `HttpMessageNotReadableException` | `400 Bad Request` |
+| `IllegalArgumentException`, `NullPointerException`, `HttpMessageNotReadableException`, `MethodArgumentTypeMismatchException` | `400 Bad Request` |
 | `BusinessEntityNotFoundException` | `404 Not Found` |
 | `VersionConflictException` | `409 Conflict` |
 | `BusinessRuleViolationException` | `403 Forbidden` |
@@ -107,7 +107,7 @@ Query endpoints accept an optional `?version=N` query parameter. When absent, th
 
 ## `supra-dispatcher-business-events-outbox-nats` — Stage 1 task builder
 
-This module implements the **first stage** of the asynchronous projection pipeline. It polls `business_event_outbox` for unclaimed events and coalesces them into `projection_tasks` by calling `BuildProjectionTasksUseCase`.
+This module implements the **first stage** of the asynchronous projection pipeline. It polls the business event outbox for unclaimed events and coalesces them into projection tasks by calling `BuildProjectionTasksUseCase`.
 
 **How it works:**
 
@@ -117,7 +117,7 @@ This module implements the **first stage** of the asynchronous projection pipeli
 4. Once a task is created, the event is acknowledged in the outbox.
 5. A NATS publisher (`NatsProjectionTasksReadyPublisher`) sends a wake signal so Stage 2 workers can start immediately.
 
-**NATS integration:** `NatsBusinessEventsWakeSubscriber` listens for wake signals published by the API runtime (via `infra-event-publisher-spring`). When a signal arrives, it triggers an immediate poll cycle rather than waiting for the next polling interval.
+**NATS integration:** `NatsBusinessEventsWakeSubscriber` listens for wake signals published by the API runtime. When a signal arrives, it triggers an immediate poll cycle rather than waiting for the next polling interval.
 
 **Segmentation:** Workers are partitioned by a stable hash of `potId` modulo `segment-count`. This ensures all events for the same pot are always processed by the same worker, preventing ordering races. Configure with `pocoma.projection.worker.segment-index` and `pocoma.projection.worker.segment-count`.
 
@@ -125,12 +125,12 @@ This module implements the **first stage** of the asynchronous projection pipeli
 
 ## `supra-dispatcher-balance-calculation-tasks-outbox-nats` — Stage 2 task executor
 
-This module implements the **second stage**: it polls `projection_tasks` and executes balance calculations by calling `ExecuteProjectionTasksUseCase`.
+This module implements the **second stage**: it polls for projection tasks and executes balance calculations by calling `ExecuteProjectionTasksUseCase`.
 
 **How it works:**
 
 1. A `SpringProjectionTaskExecutorLifecycle` starts the `ProjectionTaskExecutorWorker` on boot.
-2. The worker claims `ProjectionTask` rows from `projection_tasks` for its segment.
+2. The worker claims `ProjectionTask` rows from the projection task table for its segment.
 3. `SegmentedProjectionTaskExecutor` processes each claim by calling `ExecuteProjectionTasksUseCase.executeProjectionTask(command)`.
 4. The use case loads projected expenses, calls `PotBalancesCalculator`, and persists the new `PotBalances`.
 5. After execution, the task is acknowledged. A NATS wake signal is published for back-pressure feedback.
@@ -147,7 +147,7 @@ A generic pipeline task dispatcher that uses the `orchestrator-claimable-work-di
 
 ## `supra-dispatcher-task-materialization-nats`
 
-A NATS-backed dispatcher that drives the task materialization pipeline. It claims materializeable event records from the database via `JpaMaterializableEventSourceAdapter` and calls `MaterializeTasksUseCase` to persist the corresponding pipeline task entries. This is part of the generic pipeline task infrastructure.
+A NATS-backed dispatcher that drives the task materialization pipeline. It claims materializable event records from the database via `JpaMaterializableEventSourceAdapter` and calls `MaterializeTasksUseCase` to persist the corresponding pipeline task entries. This is part of the generic pipeline task infrastructure.
 
 ---
 

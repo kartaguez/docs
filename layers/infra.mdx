@@ -1,5 +1,5 @@
 ---
-title: "Infrastructure Layer: Persistence and Adapters"
+title: "Infrastructure Layer: JPA Adapters and Spring Wiring"
 sidebarTitle: "Infrastructure"
 description: "The infra modules implement the engine's outbound ports: JPA adapters for H2/PostgreSQL, transaction management, and Spring event publishing."
 ---
@@ -14,7 +14,7 @@ Infrastructure modules implement engine port interfaces. They are wired together
 
 ## Module layout
 
-```
+```text
 app/
   infra-persistence-jpa/         JPA adapters for all outbound persistence ports
   infra-tx-spring/               Spring @Transactional adapter for TransactionRunner
@@ -31,7 +31,7 @@ This module provides all concrete JPA adapters. Each adapter implements one or m
 
 | Adapter | Port(s) implemented | Responsibility |
 |---|---|---|
-| `JpaPotGlobalVersionAdapter` | `PotGlobalVersionPort` | Save and CAS-update the per-pot version counter |
+| `JpaPotGlobalVersionAdapter` | `PotGlobalVersionPort` | Save and conditional-update the per-pot version counter |
 | `JpaPotHeaderAdapter` | `PotHeaderPort` | Save new or replace versioned `PotHeader` rows |
 | `JpaPotShareholdersAdapter` | `PotShareholdersPort` | Save new and updated `Shareholder` rows |
 | `JpaExpenseHeaderAdapter` | `ExpenseHeaderPort` | Save new or replace versioned `ExpenseHeader` rows |
@@ -55,10 +55,10 @@ This module provides all concrete JPA adapters. Each adapter implements one or m
 
 | Adapter | Port(s) implemented | Responsibility |
 |---|---|---|
-| `JpaBusinessEventOutboxAdapter` | `BusinessEventOutboxAppendPort`, `BusinessEventOutboxPort` | Write events to `business_event_outbox`; claim and acknowledge them for task builder workers |
-| `JpaProjectionTaskAdapter` | `ProjectionTaskPort` | Write, claim, and acknowledge rows in `projection_tasks` |
+| `JpaBusinessEventOutboxAdapter` | `BusinessEventOutboxAppendPort`, `BusinessEventOutboxPort` | Write events to the outbox; claim and acknowledge them for task-builder workers |
+| `JpaProjectionTaskAdapter` | `ProjectionTaskPort` | Write, claim, and acknowledge projection task records |
 | `JpaProjectedExpenseAdapter` | `ProjectedExpensePort` | Load the expense snapshots used by `PotBalancesCalculator` |
-| `JpaPotBalancesAdapter` | `PotBalancesPort` | Read and write the computed per-shareholder `Balance` projections |
+| `JpaPotBalancesAdapter` | `PotBalancesPort` | Read and write the computed per-shareholder balance projections |
 
 ### Pipeline adapters
 
@@ -70,11 +70,11 @@ This module provides all concrete JPA adapters. Each adapter implements one or m
 
 ### Observability adapter
 
-`JpaProjectionLagAdapter` measures and stores the timestamp gap between when a business event is committed and when the corresponding balance projection is persisted. This feeds the Prometheus projection-lag metric.
+`JpaProjectionLagAdapter` measures and stores the timestamp gap between when a business event is committed and when the corresponding balance projection is persisted. This feeds the projection-lag metric.
 
 ### Database schema
 
-Flyway is the source of truth for the PostgreSQL schema. Migration scripts live in `infra-persistence-jpa/src/main/resources/db/migration`. In PostgreSQL mode Hibernate validates the schema against the migrations; it does not auto-create or auto-alter tables.
+Flyway manages all schema changes. Migration scripts live in `runtime-monolith/src/main/resources/db/migration`. In PostgreSQL mode Hibernate validates the schema against the migrations; it does not auto-create or auto-alter tables.
 
 Key tables:
 
@@ -91,7 +91,7 @@ Key tables:
 | `pot_balance` | Per-shareholder balance rows for the latest computed version |
 
 <Tip>
-H2 is the default database and uses Hibernate's `validate` strategy in tests (or `create-drop` for in-process test mode). PostgreSQL is activated with the `postgres` Spring profile. You never need to switch the JPA adapter; only the `spring.datasource.*` properties change.
+H2 is the default database for development and testing. PostgreSQL is activated with the `postgres` Spring profile. You never need to switch the JPA adapter; only the `spring.datasource.*` properties change.
 </Tip>
 
 ### Activating PostgreSQL
@@ -152,7 +152,7 @@ This module provides the `OutboxThenSpringEventPublisherAdapter`, which bridges 
 
 ```java
 public void publish(Object event) {
-    // 1. Write the event to business_event_outbox (durable, within transaction)
+    // 1. Write the event to the outbox (durable, within transaction)
     outboxPort.append(event);
     // 2. After commit, fire a Spring ApplicationEvent in the same JVM
     transactionRunner.runAfterCommit(() -> springApplicationEventPublisher.publish(event));
@@ -162,7 +162,7 @@ public void publish(Object event) {
 The two-step design means:
 
 - **The outbox write is transactional.** If the command transaction rolls back, no event is appended.
-- **The Spring `ApplicationEvent` fires post-commit.** In monolith mode, this wakes the in-process balance worker (`supra-worker-balance-calculation-events-spring`) immediately. In distributed mode the Spring event is still fired but the real workers poll the outbox via NATS.
+- **The Spring `ApplicationEvent` fires post-commit.** In monolith mode, this wakes the in-process balance worker immediately. In distributed mode the Spring event is still fired but the real workers poll the outbox via NATS.
 - **Workers in distributed mode see the event via the outbox**, not the Spring bus, so there is no risk of processing an event whose owning transaction was rolled back.
 
 ---

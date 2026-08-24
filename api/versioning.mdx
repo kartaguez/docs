@@ -1,21 +1,19 @@
 ---
 title: "Optimistic Concurrency and Versioned Reads in Pocoma"
 sidebarTitle: "Versioning"
-description: "Every Pocoma pot has a monotonically increasing version. Commands require an expectedVersion to prevent concurrent conflicts; queries can target any past version."
+description: "Pocoma pots carry a version number. Write commands require expectedVersion to prevent lost updates; read endpoints can return any historical version."
 ---
-
-## Overview
 
 Every pot in Pocoma carries a **global version number** — a monotonically increasing integer that starts at `1` when the pot is created and increments by one on every successful command. This version drives two separate mechanisms:
 
-- **Write side** — optimistic concurrency: commands must declare what version they expect to find, preventing lost-update races.
+- **Write side** — conflict detection: commands must declare what version they expect to find, preventing lost-update races.
 - **Read side** — versioned queries: any query endpoint can pin its read to a specific historical version.
 
 ---
 
-## Write Side: Optimistic Concurrency
+## Write Side: Conflict Detection
 
-Every mutating command (create expense, update pot details, add shareholders, delete pot, etc.) must include an `expectedVersion` field in its request body. Pocoma compares this value against the pot's current stored version before executing the command:
+Every mutating command (create expense, update pot details, add shareholders, delete pot, etc.) must include an `expectedVersion` field in its request body. Pocoma compares this value against the pot's current version before executing the command:
 
 - If they **match**, the command proceeds and the pot's version is incremented by one.
 - If they **differ**, the command is rejected with `409 Conflict` and error code `POT_VERSION_CONFLICT`. No state is changed.
@@ -87,7 +85,9 @@ curl -X PATCH http://localhost:8080/api/pots/7a3f9e1b-0c44-4d2e-b8fa-9f123456789
 }
 ```
 
-### Optimistic Concurrency Retry Pattern
+### Retry Pattern
+
+When you receive a `409 POT_VERSION_CONFLICT`, re-read the pot to get its current version, then retry the command:
 
 ```java
 // 1. Fetch the current pot state
@@ -97,7 +97,7 @@ long currentVersion = pot.version();
 // 2. Attempt the command with the observed version
 try {
     updatePotDetails(potId, newLabel, currentVersion);
-} catch (VersionConflictException e) {
+} catch (ConflictException e) {
     // 3. Re-fetch and retry — another process modified the pot concurrently
     pot = getPot(potId);
     currentVersion = pot.version();
@@ -151,7 +151,7 @@ The `version` parameter is a `long`. Supplying a version that does not exist (e.
 
 ## The `deleted` Flag
 
-Soft-deleting a pot increments its version and sets an internal deleted marker. This affects query behaviour differently depending on whether you are accessing the pot directly or via a list:
+Soft-deleting a pot increments its version and marks it as deleted. This affects query behaviour differently depending on whether you are accessing the pot directly or via a list:
 
 - **Direct views** (e.g. `GET /api/pots/{potId}`) — return the pot with `"deleted": true`. The entity is visible; you can still read its historical state.
 - **List endpoints** (e.g. `GET /api/pots`) — hide deleted pots entirely. A deleted pot does not appear in list results.

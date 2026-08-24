@@ -1,12 +1,14 @@
 ---
-title: "Pocoma Module Map: Where to Find Each Concern"
+title: "Pocoma Module Map: Every Maven Module and Its Role"
 sidebarTitle: "Module Map"
-description: "A directory of every Maven module in the Pocoma app, its responsibility, and which module to edit when adding a new feature."
+description: "Every Maven module in Pocoma, grouped by layer — domain, engine, infra, supra, runtime — with guidance on which to edit for each type of change."
 ---
+
+The `app/` directory is a Maven multi-module build. Each module has a single, explicit responsibility — there are no catch-all utility modules. When you need to add a feature, the module name tells you exactly where it lives.
 
 ## Maven Multi-Module Layout
 
-The `app/` directory is a Maven multi-module build. Each module has a single, explicit responsibility. There are no catch-all utility modules — if you are adding a feature, the module name tells you where it lives. The root `pom.xml` in `app/` declares all modules; `runtime-monolith` is the composition root that wires everything together for local development.
+The root `pom.xml` in `app/` declares all modules. `runtime-monolith` is the composition root that wires everything together for local development.
 
 <Note>
   Modules are grouped by layer prefix: `domain-*` for pure business logic, `engine-*` for use cases and ports, `infra-*` for infrastructure adapters, `supra-*` for inbound/outbound technology adapters, `runtime-*` for Spring Boot assembly, and shared/orchestrator modules for cross-cutting concerns.

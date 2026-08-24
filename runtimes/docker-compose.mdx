@@ -1,11 +1,11 @@
 ---
-title: "Docker Compose Deployment Modes for Pocoma"
+title: "Docker Compose Modes: H2, PostgreSQL, and Distributed"
 sidebarTitle: "Docker Compose"
-description: "Three root-level Compose files let you run Pocoma locally as a monolith with H2, a monolith with PostgreSQL, or a distributed stack with NATS and multiple workers."
+description: "Three root-level Compose files let you run Pocoma locally as a monolith with H2, a monolith with PostgreSQL, or a distributed stack with NATS."
 ---
 
 The repository root contains three Docker Compose files, each representing a
-complete, self-contained deployment topology. All files build the Java runtimes
+complete, self-contained runtime topology. All files build the Java runtimes
 from source using the `app/Dockerfile`.
 
 <Warning>
@@ -52,14 +52,14 @@ from source using the `app/Dockerfile`.
 
 ## Port Reference
 
-| Service    | Host Port | Notes                            |
-| ---------- | --------- | -------------------------------- |
-| Pocoma API | `8080`    | Overridable via `API_PORT`       |
-| Prometheus | `9090`    | Scrapes `/actuator/prometheus`   |
-| Grafana    | `3000`    | Login: `admin` / `admin`         |
-| PostgreSQL | `5432`    | PostgreSQL and distributed modes |
-| NATS       | `4222`    | Distributed mode only            |
-| NATS monitoring | `8222` | Distributed mode only          |
+| Service         | Host Port | Notes                            |
+| --------------- | --------- | -------------------------------- |
+| Pocoma API      | `8080`    | Overridable via `API_PORT`       |
+| Prometheus      | `9090`    | Scrapes `/actuator/prometheus`   |
+| Grafana         | `3000`    | Login: `admin` / `admin`         |
+| PostgreSQL      | `5432`    | PostgreSQL and distributed modes |
+| NATS            | `4222`    | Distributed mode only            |
+| NATS monitoring | `8222`    | Distributed mode only            |
 
 ---
 
@@ -140,14 +140,14 @@ All three Compose files respect the following environment variables. Set them
 in your shell before running `docker compose up`, or place them in a `.env` file
 at the repository root.
 
-| Variable                | Default              | Description                                             |
-| ----------------------- | -------------------- | ------------------------------------------------------- |
-| `POSTGRES_DB`           | `pocoma`             | PostgreSQL database name                                |
-| `POSTGRES_USER`         | `pocoma`             | PostgreSQL username                                     |
-| `POSTGRES_PASSWORD`     | `pocoma`             | PostgreSQL password                                     |
-| `API_PORT`              | `8080`               | Host port mapped to the Pocoma API container            |
-| `NATS_URL`              | `nats://nats:4222`   | NATS server URL used by dispatcher runtimes (distributed mode) |
-| `POCOMA_SEGMENT_COUNT`  | `2`                  | Number of inter-process worker segments (distributed mode) |
+| Variable               | Default            | Description                                                        |
+| ---------------------- | ------------------ | ------------------------------------------------------------------ |
+| `POSTGRES_DB`          | `pocoma`           | PostgreSQL database name                                           |
+| `POSTGRES_USER`        | `pocoma`           | PostgreSQL username                                                |
+| `POSTGRES_PASSWORD`    | `pocoma`           | PostgreSQL password                                                |
+| `API_PORT`             | `8080`             | Host port mapped to the Pocoma API container                       |
+| `NATS_URL`             | `nats://nats:4222` | NATS server URL used by dispatcher runtimes (distributed mode)     |
+| `POCOMA_SEGMENT_COUNT` | `2`                | Number of inter-process worker segments (distributed mode)         |
 
 Example — run the distributed stack with a higher segment count and a custom API port:
 
@@ -160,9 +160,9 @@ API_PORT=9000 POCOMA_SEGMENT_COUNT=4 \
 
 ## Useful Endpoints (All Modes)
 
-| Endpoint                                 | Description                     |
-| ---------------------------------------- | ------------------------------- |
-| `http://localhost:8080`                  | Pocoma REST API                 |
-| `http://localhost:8080/actuator/prometheus` | Prometheus metrics scrape    |
-| `http://localhost:9090`                  | Prometheus UI                   |
-| `http://localhost:3000`                  | Grafana dashboards (`admin` / `admin`) |
+| Endpoint                                    | Description                           |
+| ------------------------------------------- | ------------------------------------- |
+| `http://localhost:8080`                     | Pocoma REST API                       |
+| `http://localhost:8080/actuator/prometheus` | Prometheus metrics scrape             |
+| `http://localhost:9090`                     | Prometheus UI                         |
+| `http://localhost:3000`                     | Grafana dashboards (`admin` / `admin`) |

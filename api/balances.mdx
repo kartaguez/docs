@@ -1,8 +1,10 @@
 ---
-title: "Balance Endpoints: Querying Pot and User Balances"
+title: "Balance Query Endpoints: Pot Balances and User Balances"
 sidebarTitle: "Balances"
-description: "GET /api/pots/{potId}/balances returns per-shareholder balances for a pot. GET /api/pots/balances/me lists the calling user's balance across all their pots."
+description: "GET /api/pots/{potId}/balances returns shareholder balances for a pot. GET /api/pots/balances/me lists your balances across every pot you participate in."
 ---
+
+These endpoints let you query the computed balance state for pots and shareholders. A balance represents each shareholder's net financial position — how much they have overpaid or underpaid relative to their share of all recorded expenses.
 
 ## What Balances Represent
 
@@ -20,66 +22,63 @@ Amounts are expressed as exact fractions (`numerator / denominator`) to avoid fl
 
 ## How Balances Are Produced
 
-Balances are **projections**, not derived on-the-fly from commands. When a command (such as creating or updating an expense) completes, Pocoma writes a business event into the `business_event_outbox` table. An asynchronous pipeline then:
-
-1. Coalesces those events into `projection_tasks`.
-2. Executes each task to compute the new balance state and persist it.
-
-See [Projection Overview](/projection/overview) for architecture details.
+Balances are **projections** computed asynchronously after commands complete. When you create or update an expense, Pocoma processes the change and updates the stored balance state in the background.
 
 <Note>
-Because projection is asynchronous, balances may lag slightly behind the most recent commands — especially under high write load. The lag is observable via Prometheus metrics exposed at `/actuator/prometheus`. If you need to confirm that balances reflect a specific command, use the `?version=N` parameter to request balances at the exact version produced by that command.
+Because projection is asynchronous, balances may lag slightly behind the most recent commands. If you need to confirm that balances reflect a specific command, use the `?version=N` parameter to request balances at the exact version produced by that command.
 </Note>
 
 ---
 
-## GET /api/pots/\{potId\}/balances
+## `GET /api/pots/{potId}/balances` — Get pot balances
 
 Returns the computed balances for all shareholders in a specific pot.
 
-### Request
+### Path parameters
 
 <ParamField path="potId" type="string" required>
   UUID of the pot. Must be a pot the calling user has access to.
 </ParamField>
 
-<ParamField query="version" type="long">
+### Query parameters
+
+<ParamField query="version" type="integer">
   Optional. If provided, returns balances as of that pot version. If omitted, returns the latest projected balances.
 </ParamField>
 
-**Required headers:**
+### Headers
 
 | Header | Example value |
 |---|---|
 | `X-User-Id` | `22222222-2222-2222-2222-222222222222` |
 | `X-User-Scopes` | `pot:read` |
 
-### Response Body — `PotBalancesResponse`
+### Response body — `PotBalancesResponse`
 
-<ResponseField name="potId" type="string" required>
+<ResponseField name="potId" type="string">
   UUID of the pot these balances belong to.
 </ResponseField>
 
-<ResponseField name="version" type="long" required>
+<ResponseField name="version" type="integer">
   The pot version at which these balances were computed.
 </ResponseField>
 
-<ResponseField name="balances" type="BalanceResponse[]" required>
+<ResponseField name="balances" type="array">
   List of per-shareholder balance entries. One entry per shareholder in the pot.
 
   <Expandable title="BalanceResponse fields">
-    <ResponseField name="shareholderId" type="string" required>
+    <ResponseField name="shareholderId" type="string">
       UUID of the shareholder this balance entry describes.
     </ResponseField>
 
-    <ResponseField name="value" type="FractionResponse" required>
+    <ResponseField name="value" type="object">
       The net balance as an exact fraction. Positive means owed money; negative means owes money.
 
       <Expandable title="FractionResponse fields">
-        <ResponseField name="numerator" type="long" required>
+        <ResponseField name="numerator" type="integer">
           The numerator of the fraction.
         </ResponseField>
-        <ResponseField name="denominator" type="long" required>
+        <ResponseField name="denominator" type="integer">
           The denominator of the fraction. Always positive and non-zero.
         </ResponseField>
       </Expandable>
@@ -134,72 +133,73 @@ In this example, shareholder `aaaa...` is owed `3/4` of the pot's unit (they ove
 
 ---
 
-## GET /api/pots/balances/me
+## `GET /api/pots/balances/me` — List my balances across pots
 
 Returns the calling user's balance across **all pots** they participate in as a shareholder. Each entry combines the pot summary with the user's own balance in that pot.
 
 <Note>
-This endpoint identifies "you" via the `X-User-Id` header. It returns balances only for pots where the calling user's ID has been linked to a shareholder via the shareholders API.
+This endpoint identifies you via the `X-User-Id` header. It returns balances only for pots where your user ID has been linked to a shareholder via the shareholders API.
 </Note>
 
-### Request
+### Query parameters
 
-<ParamField query="version" type="long">
+<ParamField query="version" type="integer">
   Optional. Filters results to only pots that have been projected at or beyond this version. If omitted, all pots with available projections are returned at their latest projected version.
 </ParamField>
 
-**Required headers:**
+### Headers
 
 | Header | Example value |
 |---|---|
 | `X-User-Id` | `22222222-2222-2222-2222-222222222222` |
 | `X-User-Scopes` | `pot:read` |
 
-### Response Body — `UserPotBalanceResponse[]`
+### Response body — array of `UserPotBalanceResponse`
 
 An array of `UserPotBalanceResponse` objects, one per pot in which the calling user is a shareholder.
 
-<ResponseField name="pot" type="PotResponse" required>
+<ResponseField name="pot" type="object">
   Summary of the pot.
 
   <Expandable title="PotResponse fields">
-    <ResponseField name="id" type="string" required>
+    <ResponseField name="id" type="string">
       UUID of the pot.
     </ResponseField>
-    <ResponseField name="label" type="string" required>
+    <ResponseField name="label" type="string">
       Human-readable name of the pot.
     </ResponseField>
-    <ResponseField name="creatorId" type="string" required>
+    <ResponseField name="creatorId" type="string">
       UUID of the user who created the pot.
     </ResponseField>
-    <ResponseField name="deleted" type="boolean" required>
+    <ResponseField name="deleted" type="boolean">
       Whether the pot has been soft-deleted. Deleted pots may still appear here if balances were projected before deletion.
     </ResponseField>
-    <ResponseField name="version" type="long" required>
+    <ResponseField name="version" type="integer">
       The current version of the pot.
     </ResponseField>
   </Expandable>
 </ResponseField>
 
-<ResponseField name="shareholderId" type="string" required>
+<ResponseField name="shareholderId" type="string">
   UUID of the shareholder record linked to the calling user in this pot.
 </ResponseField>
 
-<ResponseField name="balance" type="BalanceResponse" required>
+<ResponseField name="balance" type="object">
   The calling user's net balance in this pot.
 
   <Expandable title="BalanceResponse fields">
-    <ResponseField name="shareholderId" type="string" required>
+    <ResponseField name="shareholderId" type="string">
       UUID of the shareholder this balance entry describes. Matches the top-level `shareholderId`.
     </ResponseField>
-    <ResponseField name="value" type="FractionResponse" required>
+
+    <ResponseField name="value" type="object">
       The net balance as an exact fraction.
 
       <Expandable title="FractionResponse fields">
-        <ResponseField name="numerator" type="long" required>
+        <ResponseField name="numerator" type="integer">
           The numerator of the fraction.
         </ResponseField>
-        <ResponseField name="denominator" type="long" required>
+        <ResponseField name="denominator" type="integer">
           The denominator of the fraction. Always positive and non-zero.
         </ResponseField>
       </Expandable>
@@ -207,7 +207,7 @@ An array of `UserPotBalanceResponse` objects, one per pot in which the calling u
   </Expandable>
 </ResponseField>
 
-<ResponseField name="version" type="long" required>
+<ResponseField name="version" type="integer">
   The pot version at which this balance was computed.
 </ResponseField>
 
@@ -291,8 +291,8 @@ Amounts are stored and returned as exact rational numbers to prevent floating-po
 
 | Field | Type | Description |
 |---|---|---|
-| `numerator` | `long` | Numerator of the fraction |
-| `denominator` | `long` | Denominator of the fraction; always positive and non-zero |
+| `numerator` | `integer` | Numerator of the fraction |
+| `denominator` | `integer` | Denominator of the fraction; always positive and non-zero |
 
 To convert to a decimal for display: `amount = numerator / denominator`.
 

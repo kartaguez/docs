@@ -1,7 +1,7 @@
 ---
 title: "Projection Task Builder: From Business Events to Tasks"
 sidebarTitle: "Task Builder"
-description: "The task builder worker polls the business_event_outbox, coalesces events per pot into COMPUTE_BALANCES_FOR_VERSION tasks, and signals task executors via wake events."
+description: "The task builder polls business_event_outbox, coalesces outbox events per pot into COMPUTE_BALANCES_FOR_VERSION tasks, and wakes task executors."
 ---
 
 ## What the Task Builder Does

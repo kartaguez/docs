@@ -1,8 +1,10 @@
 ---
 title: "Pocoma Architecture: Hexagonal Design and Async Projections"
 sidebarTitle: "Architecture"
-description: "Pocoma uses hexagonal architecture with a pure domain, a use-case engine, and pluggable infrastructure adapters. Balances are computed by an async projection pipeline."
+description: "How Pocoma is structured: hexagonal layers, a command/query split, and the async projection pipeline that keeps balance snapshots up to date."
 ---
+
+Pocoma is structured around hexagonal (ports-and-adapters) architecture with a strict layering rule: inner layers know nothing about outer layers. This page explains the layer model, the command/query split, and the async projection pipeline that keeps balances up to date.
 
 ## Layered Architecture
 

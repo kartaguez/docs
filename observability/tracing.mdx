@@ -1,7 +1,7 @@
 ---
-title: "Distributed Tracing and Log Correlation in Pocoma"
+title: "How Pocoma Propagates traceId Through the Pipeline"
 sidebarTitle: "Tracing"
-description: "Each Pocoma HTTP request receives a traceId propagated through logs, projection tasks, and worker threads, enabling full chain reconstruction from request to balance."
+description: "Pocoma assigns each HTTP request a traceId stored in outbox and task rows, letting you trace the full command-to-balance chain across logs and tables."
 ---
 
 Every HTTP request processed by Pocoma receives a `traceId`. This identifier
@@ -66,7 +66,7 @@ reconstructable by querying either table with the `traceId` from your logs.
 
     ```bash
     # Example: grep structured logs for a specific traceId
-    grep "traceId=abc-123" /var/log/pocoma-api.log
+    grep "traceId=abc-123" app.log
     ```
 
     The same `traceId` will appear in log lines for the command use case, the
@@ -104,9 +104,10 @@ reconstructable by querying either table with the `traceId` from your logs.
     landed in the balance tables:
 
     ```sql
-    SELECT *
-    FROM pot_balance_participants   -- adjust to actual projection table name
-    WHERE pot_id = '<pot-id>';
+    SELECT pot_id, version, shareholder_id, value_numerator, value_denominator
+    FROM pot_balances
+    WHERE pot_id = '<pot-id>'
+    ORDER BY version DESC;
     ```
   </Step>
 </Steps>
@@ -145,9 +146,9 @@ This metric directly answers: *how long does it take from a user's write being
 durable to a worker picking it up?*
 
 <Note>
-  Clock skew between the database server and the worker host will affect this
-  measurement. For accurate lag metrics, ensure all containers use a
-  synchronised time source (NTP or the Docker host clock).
+  Clock skew between the database server and the worker process will affect this
+  measurement. For accurate lag readings, ensure all processes share a
+  synchronised time source.
 </Note>
 
 ---

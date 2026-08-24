@@ -1,12 +1,14 @@
 ---
-title: "Pocoma: What It Is and How It Works"
+title: "Pocoma: Concepts, Commands, Queries, and Projections"
 sidebarTitle: "Introduction"
-description: "Pocoma manages shared expense pots: users create pots, add participants, record expenses, and the system computes balances via an async projection pipeline."
+description: "Learn how Pocoma manages shared expense pots — from commands and optimistic concurrency to async balance projections and the X-User-Id auth header."
 ---
+
+Pocoma is a REST API for managing shared expense pots. This page explains the core lifecycle, how the write and read sides are separated, and the key concepts you will encounter throughout the codebase.
 
 ## What Pocoma Does
 
-Pocoma is a REST API for managing shared expense pots. The typical lifecycle looks like this:
+The typical lifecycle looks like this:
 
 1. A user **creates a pot** with a name and optional details.
 2. The creator **adds shareholders** (participants) to the pot, optionally assigning fractional weights that determine how expenses are split.

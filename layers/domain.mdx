@@ -1,7 +1,7 @@
 ---
-title: "Domain Layer: Pure Business Model in Pocoma"
+title: "Domain Layer: Pocoma's Core Business Entities and Rules"
 sidebarTitle: "Domain"
-description: "The domain module contains Pocoma's pure business entities — Pot, Shareholder, Expense, and Balance — with no Spring, JPA, or HTTP dependencies."
+description: "The domain module holds Pocoma's pure business entities — Pot, Shareholder, Expense, and Balance — with no Spring, JPA, or HTTP dependencies."
 ---
 
 The `domain` module is Pocoma's innermost layer. It contains only plain Java: no Spring annotations, no JPA, no HTTP. Every class in this module can be instantiated and exercised in a plain JUnit test without loading any application context. This is the intentional core of the hexagonal architecture — if a new business rule needs to live somewhere, it belongs here.
@@ -14,7 +14,7 @@ The `domain` module has **zero runtime dependencies** beyond the JDK. Adding a S
 
 ## Module layout
 
-```
+```text
 app/
   domain/             Pure business aggregates, entities, value objects, factories
   domain-policy/      Authorization rules checked before commands execute
@@ -52,7 +52,7 @@ Manages the set of `Shareholder` entities attached to a pot. Tracks which shareh
 
 Key methods: `addShareholder(Name, Weight, UserId)`, `updateShareholderDetails(ShareholderId, Name, UserId)`, `updateShareholderWeight(ShareholderId, Weight)`.
 
-Throws `BusinessRuleViolationException("SHAREHOLDER_NOT_PRESENT", ...)` when an operation targets an unknown or deleted shareholder.
+Throws `BusinessRuleViolationException("SHAREHOLDER_NOT_PRESENT", ...)` when an operation targets an unknown shareholder, and `BusinessRuleViolationException("SHAREHOLDER_DELETED", ...)` when the targeted shareholder is soft-deleted.
 
 ### `ExpenseHeader`
 
@@ -67,7 +67,7 @@ Represents the metadata of a single expense entry within a pot.
 | `label` | `Label` | Display name |
 | `deleted` | `boolean` | Soft-delete flag |
 
-Key methods: `updateDetails(ShareholderId, Amount, Label)`, `markAsDeleted()`.
+Key methods: `updateDetails(ShareholderId, Amount, Label)`, `markAsDeleted()`. Throws `BusinessRuleViolationException("EXPENSE_DELETED", ...)` when attempting to mutate a deleted expense.
 
 ### `ExpenseShares`
 
@@ -172,7 +172,7 @@ The `domain-policy` module contains authorization rules. These are plain Java cl
 </CardGroup>
 
 <Note>
-Policy rules contain `TODO` comments marking the intended future access-control model: `userId in shareholders.userId && userScopes.contains(pot:create)`. Today the scope set is constructed from the `X-User-Scopes` header by the supra layer and passed through `UserContext`.
+Scope strings are constructed by the supra layer from the `X-User-Scopes` header and passed through `UserContext` to every policy check. To add a new permission, define the new `Scope.Resource` and `Scope.Action` variants in the `domain-policy` module and reference them in the relevant policy class.
 </Note>
 
 ---
@@ -192,19 +192,21 @@ For each expense, the payer's balance is credited by the full `amount`. Each sha
 
 ```java
 // Simplified balance contribution for one expense
-Fraction totalWeight = shares.values().stream()
-    .map(s -> s.weight().value())
+Fraction totalWeight = shares.shares().values().stream()
+    .map(share -> share.weight().value())
     .reduce(Fraction.ZERO, Fraction::add);
 
 // Payer receives credit for the full amount
 put(result, header.payerId(), header.amount().value());
 
 // Each shareholder is debited their proportional share
-shares.values().forEach(share -> {
-    Fraction debit = header.amount().value()
+shares.shares().values().forEach(share -> {
+    Fraction shareAmount = header.amount().value()
         .multiply(share.weight().value())
-        .divide(totalWeight)
-        .negate();
+        .divide(totalWeight);
+    Fraction debit = Fraction.ZERO.subtract(shareAmount);
+    Fraction current = result.getOrDefault(share.shareholderId(),
+        new Balance(share.shareholderId(), Fraction.ZERO)).value();
     put(result, share.shareholderId(), current.add(debit));
 });
 ```

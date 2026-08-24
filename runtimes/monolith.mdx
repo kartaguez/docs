@@ -1,5 +1,5 @@
 ---
-title: "Running Pocoma as a Monolith"
+title: "Pocoma Monolith Runtime: H2 and PostgreSQL Spring Profiles"
 sidebarTitle: "Monolith"
 description: "Run all Pocoma roles in a single process using runtime-monolith. Supports both H2 (default) and PostgreSQL modes via Spring profiles."
 ---
@@ -106,8 +106,7 @@ automatically on first boot.
     Pass the `postgres` Spring profile to activate the PostgreSQL datasource:
 
     ```bash
-    ./mvnw -pl runtime-monolith spring-boot:run \
-      -Dspring-boot.run.profiles=postgres
+    ./mvnw -pl runtime-monolith spring-boot:run -Dspring-boot.run.profiles=postgres
     ```
   </Step>
 </Steps>
@@ -134,11 +133,11 @@ curl -s http://localhost:8080/actuator/prometheus | grep pocoma_projection
 
 Useful local endpoints:
 
-| Endpoint                              | Description                   |
-| ------------------------------------- | ----------------------------- |
-| `http://localhost:8080`               | Pocoma REST API               |
-| `http://localhost:8080/actuator/health` | Spring Boot health indicator |
-| `http://localhost:8080/actuator/prometheus` | Prometheus metrics scrape |
+| Endpoint                                    | Description                        |
+| ------------------------------------------- | ---------------------------------- |
+| `http://localhost:8080`                     | Pocoma REST API                    |
+| `http://localhost:8080/actuator/health`     | Spring Boot health indicator       |
+| `http://localhost:8080/actuator/prometheus` | Prometheus metrics scrape          |
 
 For full observability with Prometheus and Grafana pre-wired, use the
 [Docker Compose monolith modes](/runtimes/docker-compose) instead.

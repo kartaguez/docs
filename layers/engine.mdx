@@ -1,5 +1,5 @@
 ---
-title: "Engine Layer: Use Cases and Ports in Pocoma"
+title: "Engine Layer: Use Cases, Ports, and Commands in Pocoma"
 sidebarTitle: "Engine"
 description: "The engine layer defines Pocoma's use cases and port interfaces. It orchestrates business logic without depending on Spring, JPA, or HTTP."
 ---
@@ -14,7 +14,7 @@ The engine modules depend on `domain` and `domain-policy` but not on any infrast
 
 ## Module layout
 
-```
+```text
 app/
   engine-core/        UserContext, business events, version model, snapshot types,
                         core outbound ports (transaction, outbox, balances, shareholders)
@@ -101,9 +101,9 @@ Projection use cases are triggered by workers, not HTTP clients.
 
 | Use case | Description |
 |---|---|
-| `BuildProjectionTasksUseCase` | Consumes a `BuildProjectionTaskCommand` (wrapping a business event from `business_event_outbox`) and coalesces it into a `projection_task` record |
-| `ExecuteProjectionTasksUseCase` | Consumes an `ExecuteProjectionTaskCommand` (wrapping a claimed `projection_task`) and calls `PotBalancesCalculator` to compute and persist updated balances |
-| `ComputePotBalancesUseCase` | Internal helper invoked by `ExecuteProjectionTasksUseCase`; loads projected expenses and calls the domain calculator |
+| `BuildProjectionTasksUseCase` | Consumes a `BuildProjectionTaskCommand` and coalesces it into a projection task record |
+| `ExecuteProjectionTasksUseCase` | Consumes an `ExecuteProjectionTaskCommand` and calls `PotBalancesCalculator` to compute and persist updated balances |
+| `ComputePotBalancesUseCase` | Helper invoked by `ExecuteProjectionTasksUseCase`; loads projected expenses and calls the domain calculator |
 
 ---
 
@@ -129,10 +129,10 @@ Projection use cases are triggered by workers, not HTTP clients.
     The aggregate method is called (e.g. `potHeader.updateDetails(Label.of(command.label()))`). The aggregate enforces remaining invariants (e.g. cannot mutate a deleted entity).
   </Step>
   <Step title="Version is incremented and persisted">
-    A new `PotGlobalVersion(potId, currentVersion + 1)` is constructed. `PotGlobalVersionPort.updateIfActive(currentVersion, nextVersion)` applies an atomic CAS update — if another request changed the version between load and persist, the update fails.
+    A new `PotGlobalVersion(potId, currentVersion + 1)` is constructed. `PotGlobalVersionPort.updateIfActive(currentVersion, nextVersion)` applies an atomic conditional update — if another request changed the version between load and persist, the update fails.
   </Step>
-  <Step title="Business event is published to outbox">
-    The engine calls `EventPublisherPort.publish(new PotDetailsUpdatedEvent(potId, nextVersion))`. The infra adapter writes this into `business_event_outbox` and schedules a Spring `ApplicationEvent` to fire after the transaction commits (for monolith mode) or leaves it for NATS dispatcher polling (for distributed mode).
+  <Step title="Business event is published">
+    The engine calls `EventPublisherPort.publish(new PotDetailsUpdatedEvent(potId, nextVersion))`. The infra adapter writes this to the outbox and schedules an in-process notification to fire after the transaction commits.
   </Step>
   <Step title="Snapshot is returned">
     The service returns a versioned snapshot record (e.g. `PotHeaderSnapshot`) containing the new state and version number. The controller maps this to the HTTP response DTO.
@@ -158,7 +158,7 @@ public void assertUpdatePreconditions(long expectedVersion) {
 }
 ```
 
-The `PotGlobalVersionPort.updateIfActive(currentVersion, nextVersion)` call then applies a database-level conditional update (a `WHERE version = ?` clause in the JPA adapter), providing a second safety net against concurrent writes that slip through between the load and the persist.
+The `PotGlobalVersionPort.updateIfActive(currentVersion, nextVersion)` call then applies a database-level conditional update, providing a second safety net against concurrent writes that slip through between the load and the persist.
 
 <Warning>
 When a `VersionConflictException` is thrown, the HTTP layer returns `409 Conflict`. The client is responsible for re-fetching the current version and retrying if appropriate.
@@ -183,16 +183,16 @@ Each event carries a `PotId` and the new `version` number. Workers use these to 
 | Port | Module | Purpose |
 |---|---|---|
 | `TransactionRunner` | `engine-core` | `runInTransaction(Supplier)` and `runAfterCommit(Runnable)` |
-| `PotGlobalVersionPort` | `engine-command` | Save/CAS-update the pot's version clock |
+| `PotGlobalVersionPort` | `engine-command` | Save/conditional-update the pot's version clock |
 | `PotHeaderPort` | `engine-command` | Save new or replace versioned `PotHeader` |
 | `PotContextPort` | `engine-command` | Load the precondition context for each command type |
-| `EventPublisherPort` | `engine-command` | Publish a business event (writes to outbox) |
-| `BusinessEventOutboxAppendPort` | `engine-core` | Append raw event to `business_event_outbox` |
+| `EventPublisherPort` | `engine-command` | Publish a business event to the durable outbox |
+| `BusinessEventOutboxAppendPort` | `engine-core` | Append a raw event to the outbox table |
 | `PotQueryPort` | `engine-query` | Read-side pot and shareholder queries |
 | `ExpenseQueryPort` | `engine-query` | Read-side expense queries |
 | `PotBalancesPort` | `engine-core` | Read and write computed balance projections |
-| `BusinessEventOutboxPort` | `engine-projection` | Claim and ack events from `business_event_outbox` |
-| `ProjectionTaskPort` | `engine-projection` | Claim and ack tasks from `projection_tasks` |
+| `BusinessEventOutboxPort` | `engine-projection` | Claim and acknowledge events from the outbox |
+| `ProjectionTaskPort` | `engine-projection` | Claim and acknowledge projection task records |
 | `ProjectedExpensePort` | `engine-projection` | Load the projected expense snapshots used by the calculator |
 
 ---

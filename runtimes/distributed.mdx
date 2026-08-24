@@ -1,12 +1,12 @@
 ---
-title: "Running Pocoma in Split / Distributed Mode"
+title: "Running Pocoma in Split Mode with Dedicated Runtimes"
 sidebarTitle: "Distributed"
 description: "Run Pocoma's HTTP API, business-event task builders, and balance-task executors as separate processes with worker segmentation for horizontal scalability."
 ---
 
 Split mode decomposes `runtime-monolith` into dedicated runtimes, each owning a
-single responsibility. This matches the target production deployment shape and
-enables each tier to be scaled, restarted, and observed independently.
+single responsibility. This matches the target deployment shape and enables each
+tier to be scaled, restarted, and observed independently.
 
 <Note>
   NATS is required in split mode. Each dispatcher runtime subscribes to
@@ -17,7 +17,7 @@ enables each tier to be scaled, restarted, and observed independently.
 
 ---
 
-## The Five Dedicated Runtimes
+## The Three Dedicated Runtimes
 
 <CardGroup cols={2}>
   <Card title="runtime-web-api" icon="globe">
@@ -34,14 +34,6 @@ enables each tier to be scaled, restarted, and observed independently.
     **Task executor.** Reads `projection_tasks`, calls
     `ExecuteProjectionTasksUseCase`, and writes results to the
     `pot_balance_*` projection tables.
-  </Card>
-  <Card title="runtime-task-materialization-dispatcher" icon="layer-group">
-    **Task materialization dispatcher.** Handles the materialization stage of the
-    projection pipeline for derived read models.
-  </Card>
-  <Card title="runtime-pipeline-task-executor" icon="gears">
-    **Pipeline task executor.** Executes generic pipeline tasks produced earlier
-    in the projection chain.
   </Card>
 </CardGroup>
 
