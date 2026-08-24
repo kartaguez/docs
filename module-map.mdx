@@ -1,0 +1,103 @@
+---
+title: "Pocoma Module Map: Where to Find Each Concern"
+sidebarTitle: "Module Map"
+description: "A directory of every Maven module in the Pocoma app, its responsibility, and which module to edit when adding a new feature."
+---
+
+## Maven Multi-Module Layout
+
+The `app/` directory is a Maven multi-module build. Each module has a single, explicit responsibility. There are no catch-all utility modules — if you are adding a feature, the module name tells you where it lives. The root `pom.xml` in `app/` declares all modules; `runtime-monolith` is the composition root that wires everything together for local development.
+
+<Note>
+  Modules are grouped by layer prefix: `domain-*` for pure business logic, `engine-*` for use cases and ports, `infra-*` for infrastructure adapters, `supra-*` for inbound/outbound technology adapters, `runtime-*` for Spring Boot assembly, and shared/orchestrator modules for cross-cutting concerns.
+</Note>
+
+---
+
+## Module Reference
+
+| Module | Layer | Responsibility |
+|---|---|---|
+| `domain` | Domain | Pure business model: `Pot`, `Shareholder`, `Expense`, value objects (`Amount`, `Fraction`, `Label`, `Name`), aggregate headers, factories, and domain exceptions. No Spring, no JPA. |
+| `domain-pipeline-tasks` | Domain | Pipeline task domain types used across the projection pipeline. |
+| `domain-policy` | Domain | Business authorization rules. Determines whether a given caller is permitted to execute a command or view a resource. |
+| `domain-projection` | Domain | Pure, deterministic balance computation: `PotBalancesCalculator`. Takes pot state as input, emits balance data. No Spring, no repositories. |
+| `engine-command` | Engine | Command use cases (`CreatePotUseCase`, `AddPotShareholdersUseCase`, `CreateExpenseUseCase`, etc.) and command intent objects. Orchestrates domain mutations and event publication via ports. |
+| `engine-core` | Engine | Shared engine types: port interfaces (`PotRepositoryPort`, `EventPublisherPort`, `TransactionPort`), engine events, and types referenced across engine modules. |
+| `engine-projection` | Engine | Projection use cases: `BuildProjectionTasksUseCase` (events → tasks) and `ExecuteProjectionTasksUseCase` (tasks → balance persistence). |
+| `engine-query` | Engine | Query use cases (`GetPotUseCase`, `GetPotBalancesUseCase`, `ListUserPotsUseCase`, etc.) and query result snapshots. Read-only; never emits events. |
+| `engine-task-execution` | Engine | Use cases for executing pipeline tasks within the segmented worker pool. |
+| `engine-task-materialization` | Engine | Use cases for materializing pipeline tasks — persisting the output of task execution back to projection tables. |
+| `infra-persistence-jpa` | Infrastructure | JPA adapters implementing `PotRepositoryPort`, `BusinessEventOutboxPort`, and `ProjectionTaskPort`. Supports H2 (default) and PostgreSQL (via `postgres` Spring profile). Flyway manages the PostgreSQL schema. |
+| `infra-tx-spring` | Infrastructure | Spring `@Transactional` adapter implementing `TransactionPort`. Keeps the engine independent of Spring's transaction machinery. |
+| `infra-event-publisher-spring` | Infrastructure | Spring `ApplicationEvent` adapter implementing `EventPublisherPort`. Used in monolith mode to publish business events as Spring application events after transaction commit. |
+| `observability` | Cross-cutting | Trace and measurement abstractions: `TraceId` propagation, Micrometer-based metrics for command latency, projection backlog, version gap, and end-to-end projection latency. |
+| `orchestrator-claimable-work-dispatcher` | Cross-cutting | Generic claimable-work dispatcher: `ClaimableWorkDispatcher`, `SegmentedWorkerPool`, `WorkWakeBus`, claim/lease lifecycle, and wake signal contracts. Business-agnostic; reused by both projection workers. |
+| `shared-runtime-spring-config` | Shared | Shared Spring auto-configuration imported by multiple runtimes (datasource, JPA, transaction, Flyway, Actuator). Avoids duplicating boot config across runtime modules. |
+| `shared-supra-dispatcher-projection` | Shared | Shared projection dispatcher contracts: `ProjectionWakeSignals`, `ProjectionTask`, and `ProjectionTaskExecutorSettings`. Referenced by both NATS dispatchers and the Spring-event worker. |
+| `supra-http-rest-spring` | Supra | Spring MVC REST controllers (`PotsCommandController`, `PotsQueryController`, `ExpensesCommandController`, `ExpensesQueryController`), request/response DTOs, request body validation, error handling, OpenAPI config, and security context (reads `X-User-Id`). |
+| `supra-dispatcher-business-events-outbox-nats` | Supra | NATS-backed task builder worker: subscribes to `pocoma.projection.business-events.available`, polls `business_event_outbox` for its inter-process segment, calls `BuildProjectionTasksUseCase`, and publishes `pocoma.projection.tasks.available`. |
+| `supra-dispatcher-balance-calculation-tasks-outbox-nats` | Supra | NATS-backed task executor worker: subscribes to `pocoma.projection.tasks.available`, polls `projection_tasks` for its segment, calls `ExecuteProjectionTasksUseCase` via `SegmentedProjectionTaskExecutor`, and publishes `pocoma.projection.tasks.processed`. |
+| `supra-dispatcher-pipeline-tasks` | Supra | Generic pipeline task dispatcher: common wiring shared between the task builder and task executor NATS adapters. |
+| `supra-dispatcher-task-materialization-nats` | Supra | NATS-backed task materialization dispatcher: handles durable persistence of task execution results. |
+| `supra-worker-balance-calculation-events-spring` | Supra | Spring-event-driven balance calculation worker. Listens to local Spring application events instead of NATS; used in monolith mode (`event-listener-enabled=true`). |
+| `runtime-web-api` | Runtime | Spring Boot assembly for the HTTP API role only. Includes `supra-http-rest-spring`, `engine-command`, `engine-query`, `infra-*`, and `observability`. Does not start projection workers. |
+| `runtime-business-events-outbox-dispatcher` | Runtime | Spring Boot assembly for the task builder role. Runs `ProjectionTaskBuilderWorker` against a shared PostgreSQL instance. Can run as multiple instances with different `segment-index` values. |
+| `runtime-balance-calculation-tasks-dispatcher` | Runtime | Spring Boot assembly for the task executor role. Runs `ProjectionTaskExecutorWorker`. Pairs with `runtime-business-events-outbox-dispatcher` in the split-runtime deployment. |
+| `runtime-monolith` | Runtime | All-in-one Spring Boot assembly. Wires every layer into a single process for local development. Supports `api`, `worker`, `postgres`, and default H2 profiles. |
+| `runtime-pipeline-task-executor` | Runtime | Spring Boot assembly for running the pipeline task executor in isolation. |
+| `runtime-task-materialization-dispatcher` | Runtime | Spring Boot assembly for the task materialization dispatcher role. |
+
+---
+
+## Where to Add a New Feature
+
+<Tip>
+  Follow the layer order: domain first, then engine ports, then the use case, then the infrastructure adapter, then the supra entry point. Tests at each layer keep the inner layers honest without requiring a full Spring context.
+</Tip>
+
+### New Command (e.g., "archive a pot")
+
+| Step | Module to edit | What to add |
+|---|---|---|
+| 1 | `domain` | Any new aggregate behavior or value object the command requires. |
+| 2 | `domain-policy` | Authorization rule for who may execute this command. |
+| 3 | `engine-core` | Port method on `PotRepositoryPort` (if new persistence is needed). New business event type if the command triggers downstream projection work. |
+| 4 | `engine-command` | New `*Command` intent record and `*UseCase` interface. Implement the use case service in the `service` package. |
+| 5 | `infra-persistence-jpa` | Implement any new repository port method; add a Flyway migration if the schema changes. |
+| 6 | `supra-http-rest-spring` | Add a new controller method, request DTO, response DTO, and mapper. |
+
+### New Query (e.g., "list all expenses by shareholder")
+
+| Step | Module to edit | What to add |
+|---|---|---|
+| 1 | `engine-core` | New read port method if the query needs a new database projection. |
+| 2 | `engine-query` | New `*Query` intent record, result snapshot, and `*UseCase` interface + implementation. |
+| 3 | `infra-persistence-jpa` | Implement the new read query (JPQL or native SQL). |
+| 4 | `supra-http-rest-spring` | Add controller method and response DTO. |
+
+### New Business Rule (e.g., "a pot may not exceed N shareholders")
+
+| Step | Module to edit | What to add |
+|---|---|---|
+| 1 | `domain` | Add the constraint check inside the relevant aggregate or factory method. Throw `BusinessRuleViolationException`. |
+| 2 | `domain-policy` | If the rule is caller-dependent (authorization), add it here instead of or in addition to domain. |
+| 3 | — | No infrastructure changes needed; domain tests cover the rule directly. |
+
+### New Projection (e.g., "running total per shareholder over time")
+
+| Step | Module to edit | What to add |
+|---|---|---|
+| 1 | `domain-projection` | Add the pure calculation logic, alongside `PotBalancesCalculator`. |
+| 2 | `engine-projection` | Add a new use case (or extend `ExecuteProjectionTasksUseCase`) to persist the new projection output. |
+| 3 | `infra-persistence-jpa` | Add JPA entities and repository for the new projection table; add a Flyway migration. |
+| 4 | `engine-query` | Add a query use case that reads from the new projection table. |
+| 5 | `supra-http-rest-spring` | Expose the new projection via a read endpoint. |
+
+### New API Endpoint (e.g., "GET /pots/{id}/summary")
+
+| Step | Module to edit | What to add |
+|---|---|---|
+| 1 | `engine-query` | Add the use case and result snapshot. |
+| 2 | `infra-persistence-jpa` | Implement any new repository query. |
+| 3 | `supra-http-rest-spring` | Add the controller method and response DTO. No changes to engine or domain needed for a purely additive read endpoint. |

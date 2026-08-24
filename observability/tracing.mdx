@@ -1,0 +1,167 @@
+---
+title: "Distributed Tracing and Log Correlation in Pocoma"
+sidebarTitle: "Tracing"
+description: "Each Pocoma HTTP request receives a traceId propagated through logs, projection tasks, and worker threads, enabling full chain reconstruction from request to balance."
+---
+
+Every HTTP request processed by Pocoma receives a `traceId`. This identifier
+is propagated through every step of the application chain — from the moment a
+command arrives at the REST layer to the moment the resulting projection is
+persisted. Because the `traceId` appears in every log line and in the durable
+database rows, you can reconstruct the full lifecycle of any user action from a
+single identifier.
+
+---
+
+## The Full Propagation Chain
+
+```text
+HTTP request
+  → traceId assigned
+  → Command use case executes (logged with traceId)
+  → Business state committed to database
+  → business_event_outbox row written
+      ├── trace_id column ← traceId stored durably
+      └── command_committed_at_nanos column ← commit timestamp for lag measurement
+
+Task-builder worker wakes, claims outbox row
+  → projection_tasks row created
+      └── trace_id propagated from outbox row
+
+Balance-calculation worker claims projection_tasks row
+  → ExecuteProjectionTasksUseCase runs (logged with traceId)
+  → pot_balance_* tables updated
+  → Projection pipeline complete
+```
+
+Because `trace_id` is stored in both `business_event_outbox` and
+`projection_tasks`, the complete chain from HTTP command to persisted balance is
+reconstructable by querying either table with the `traceId` from your logs.
+
+---
+
+## Fields Stored in the Database
+
+### `business_event_outbox`
+
+| Column | Purpose |
+|---|---|
+| `trace_id` | The `traceId` assigned to the originating HTTP request |
+| `command_committed_at_nanos` | Nanosecond timestamp of the command transaction commit — used to compute the delay between commit and worker processing start |
+
+### `projection_tasks`
+
+| Column | Purpose |
+|---|---|
+| `trace_id` | Propagated from the outbox row that produced this task — ties task execution back to the original HTTP request |
+
+---
+
+## Tracing a Request End-to-End
+
+<Steps>
+  <Step title="Find the traceId in the API logs">
+    When a command is processed, the API runtime logs the `traceId` alongside the
+    request path and HTTP status. Filter application logs for the traceId:
+
+    ```bash
+    # Example: grep structured logs for a specific traceId
+    grep "traceId=abc-123" /var/log/pocoma-api.log
+    ```
+
+    The same `traceId` will appear in log lines for the command use case, the
+    transaction commit, and the event publication.
+  </Step>
+
+  <Step title="Locate the outbox row">
+    Look up the corresponding row in `business_event_outbox` to see its current
+    status and the `command_committed_at_nanos` timestamp:
+
+    ```sql
+    SELECT id, pot_id, version, status, trace_id, command_committed_at_nanos
+    FROM business_event_outbox
+    WHERE trace_id = 'abc-123';
+    ```
+  </Step>
+
+  <Step title="Follow through to projection_tasks">
+    Once the task-builder worker has processed the outbox row, a corresponding
+    `projection_tasks` row exists with the same `trace_id`:
+
+    ```sql
+    SELECT id, pot_id, target_version, status, trace_id,
+           accepted_at, started_at, done_at
+    FROM projection_tasks
+    WHERE trace_id = 'abc-123';
+    ```
+
+    The `accepted_at`, `started_at`, and `done_at` timestamps show where the task
+    spent time in the pipeline.
+  </Step>
+
+  <Step title="Verify the balance projection">
+    With `pot_id` and `target_version` from the task row, confirm the projection
+    landed in the balance tables:
+
+    ```sql
+    SELECT *
+    FROM pot_balance_participants   -- adjust to actual projection table name
+    WHERE pot_id = '<pot-id>';
+    ```
+  </Step>
+</Steps>
+
+---
+
+## The Observability Module
+
+Trace and measurement abstractions are centralised in the `app/observability`
+module. All other modules that need to emit metrics or propagate trace context
+depend on this module — not on Micrometer or Prometheus directly.
+
+```text
+app/
+  observability/     ← Trace and measurement abstractions
+    TraceContext      Carries traceId through use case boundaries
+    MeasurementPort   Port for recording latencies and counters
+    ...
+```
+
+This keeps the `domain`, `engine-*`, and `supra-*` modules free from
+observability framework dependencies. The concrete Micrometer implementation is
+wired by the runtime modules.
+
+---
+
+## Lag Measurement via `command_committed_at_nanos`
+
+The `command_committed_at_nanos` column in `business_event_outbox` records the
+exact nanosecond at which the command transaction committed. When a task-builder
+worker begins processing an outbox row, the difference between
+`command_committed_at_nanos` and the current clock is emitted as the
+**"delay between command commit and worker processing start"** Prometheus metric.
+
+This metric directly answers: *how long does it take from a user's write being
+durable to a worker picking it up?*
+
+<Note>
+  Clock skew between the database server and the worker host will affect this
+  measurement. For accurate lag metrics, ensure all containers use a
+  synchronised time source (NTP or the Docker host clock).
+</Note>
+
+---
+
+## Grafana and Prometheus Integration
+
+The `traceId` itself is not displayed in Grafana dashboards — it is a per-request
+identifier suited to log queries. Grafana surfaces the **aggregate** picture:
+
+- Prometheus scrapes `/actuator/prometheus` and stores time-series data.
+- Grafana queries Prometheus to render latency histograms, backlog gauges, and
+  version-gap distributions.
+- Log-level trace correlation (finding a specific `traceId`) is done directly in
+  application logs or a log aggregation system pointed at the same containers.
+
+For setup, see [Metrics](/observability/metrics). Grafana is available at
+`http://localhost:3000` (`admin` / `admin`) in all Docker Compose modes.

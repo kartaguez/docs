@@ -1,0 +1,177 @@
+---
+title: "Projection Task Executor: Running Balance Calculations"
+sidebarTitle: "Task Executor"
+description: "The task executor claims COMPUTE_BALANCES_FOR_VERSION tasks from projection_tasks, runs PotBalancesCalculator, and persists the results to the balance projection tables."
+---
+
+## What the Task Executor Does
+
+The task executor is the **second stage** of Pocoma's projection pipeline. It consumes the `COMPUTE_BALANCES_FOR_VERSION` tasks that the task builder has coalesced into `projection_tasks`, runs the balance calculator, and writes the results to the `pot_balance_*` projection tables.
+
+Its responsibilities are:
+
+1. Wake on a `PROJECTION_TASKS_AVAILABLE` signal or a polling timeout.
+2. Ask `SegmentedProjectionTaskExecutor` how much queue capacity is currently available.
+3. Claim at most that many tasks from its hash segment.
+4. Submit each task to `SegmentedWorkerPool` via `trySubmit`.
+5. For each submitted task, execute `ExecuteProjectionTasksUseCase` → `PotBalancesCalculator` on a segment thread.
+6. Persist balance results and mark the task `DONE` (or `FAILED` after retries).
+
+## Module and Runtime
+
+| Concern | Artifact |
+|---|---|
+| Implementation module | `app/supra-dispatcher-balance-calculation-tasks-outbox-nats` |
+| Spring Boot runtime | `app/runtime-balance-calculation-tasks-dispatcher` |
+
+The Spring profile `postgres` must be active. Segment assignment uses the same `pocoma.projection.worker.segment-index` / `segment-count` properties as the task builder, though the two runtimes are independent and can use different segment configurations.
+
+## Step-by-Step Flow
+
+<Steps>
+  <Step title="Wake">
+    The worker waits for a `PROJECTION_TASKS_AVAILABLE(potId)` signal **for its
+    partition** or for `task-executor-polling-interval` (default 100 ms),
+    whichever comes first. In split mode the signal arrives over NATS on
+    `pocoma.projection.tasks.available`.
+  </Step>
+  <Step title="Capacity check">
+    Before issuing a DB claim, the supra dispatcher calls
+    `SegmentedProjectionTaskExecutor.availableCapacity()`. This returns how
+    many slots are free across all in-process segment queues. If capacity is
+    zero, the claim is skipped entirely — the DB is not queried and the worker
+    waits for a `CAPACITY_AVAILABLE` signal or the next timeout.
+  </Step>
+  <Step title="Claim batch">
+    The supra dispatcher calls `ProjectionTaskWorkSource`, which issues a
+    `SELECT … FOR UPDATE SKIP LOCKED` on `projection_tasks` filtered by
+    `pot_partition_hash % segmentCount = segmentIndex`. Up to the available
+    capacity (capped by `task-executor-batch-size`, default 100) rows move from
+    `PENDING` to `CLAIMED`.
+  </Step>
+  <Step title="trySubmit to SegmentedWorkerPool">
+    For each claimed task the supra worker calls
+    `SegmentedProjectionTaskExecutor.trySubmit(task)`. The call returns
+    immediately with `ACCEPTED` or `REFUSED`. If the local segment queue filled
+    up between the capacity check and the submit, `trySubmit` returns `REFUSED`
+    and the supra worker releases that row back to `PENDING`.
+  </Step>
+  <Step title="Segment thread execution">
+    Accepted tasks wait in a bounded per-segment queue. The segment thread
+    dequeues them in order, marks the task `RUNNING`, and invokes
+    `ExecuteProjectionTasksUseCase.executeProjectionTask(task)`.
+  </Step>
+  <Step title="PotBalancesCalculator">
+    The use case calls `PotBalancesCalculator` with the pot's full event
+    history up to `target_version`. The calculator is pure — no Spring, no
+    repositories, no side effects. The result is a set of balance records.
+  </Step>
+  <Step title="Persist and complete">
+    The use case persists balance records to `pot_balance_*` tables.
+    `ProjectionTaskWorkSource` then marks the task `DONE` (or `FAILED` after
+    `max-retries` exhausted) and publishes a `ProjectionTaskProcessedEvent`,
+    which the NATS adapter forwards to `pocoma.projection.tasks.processed`.
+  </Step>
+</Steps>
+
+## The `projection_tasks` Table
+
+| Field | Description |
+|---|---|
+| `task_type` | Currently always `COMPUTE_BALANCES_FOR_VERSION`. |
+| `pot_id` | The pot whose balances should be computed. |
+| `target_version` | The pot version to project to. May be raised by the task builder while the task is still `PENDING`. |
+| `pot_partition_hash` | Stable hash of `pot_id`; routes this task to the correct executor segment. |
+| `status` | Lifecycle status (see below). |
+| `claim_token` | Random fencing token written at claim time. All transitions validate this token. |
+| `claimed_by` | Diagnostic worker ID. Informational only. |
+| `lease_until` | Timestamp after which another worker may reclaim this task. |
+| `accepted_at` | When the task was accepted into the local in-process queue. |
+| `started_at` | When the segment thread began execution. |
+| `done_at` | When the task completed successfully. |
+| `failed_at` | When the task was permanently marked `FAILED`. |
+
+### Status Lifecycle
+
+```text
+PENDING
+  │
+  ▼ executor claims (writes claim_token + lease_until)
+CLAIMED
+  │
+  ▼ trySubmit accepted by local queue
+ACCEPTED
+  │
+  ▼ segment thread starts execution
+RUNNING
+  │
+  ├─▶ DONE        (balances persisted successfully)
+  ├─▶ FAILED      (max-retries exhausted)
+  └─▶ SUPERSEDED  (a newer COMPUTE_BALANCES_FOR_VERSION task was already DONE
+                   for a higher version, making this one redundant)
+
+CLAIMED / ACCEPTED → PENDING  (lease expired, process restart, or trySubmit refused)
+```
+
+<Note>
+  `SUPERSEDED` is a safe terminal state. It means the balance was already
+  computed at a version that incorporates the work this task would have done.
+  No data is lost.
+</Note>
+
+## SegmentedWorkerPool
+
+`SegmentedWorkerPool` is the generic in-process execution pool used by the task executor (and, internally, by the task builder as well). Key design decisions:
+
+- **Bounded queues per segment.** Each segment has its own queue with a configurable capacity (`queue-capacity`). When a queue is full, `trySubmit` returns `REFUSED` immediately — it never blocks the calling thread.
+- **Order preservation per key.** Tasks for the same `potId` are always routed to the same in-process segment. This prevents two threads from concurrently computing balances for the same pot.
+- **Non-blocking submit.** The supra dispatcher thread submits and moves on. It releases any refused task back to `PENDING` so the DB row is not held indefinitely.
+- **Retry with backoff.** Failed executions inside a segment are retried up to `max-retries` times with exponential backoff between `initial-backoff` and `max-backoff`. After all retries fail, the task is marked `FAILED`.
+
+## SegmentedProjectionTaskExecutor
+
+`SegmentedProjectionTaskExecutor` is the balance-specific adapter on top of `SegmentedWorkerPool`:
+
+- It partitions tasks by `potId` to preserve order per pot.
+- It delegates computation to `ExecuteProjectionTasksUseCase.executeProjectionTask(…)`.
+- It **does not** claim work, release work, or update task statuses — those responsibilities belong to the supra dispatcher layer.
+- It emits `CAPACITY_AVAILABLE(potId)` signals when a segment queue drains, allowing the outer polling loop to claim more work without waiting for the full polling timeout.
+
+## Two Segment Dimensions
+
+The executor uses two independent segment dimensions, and it is important not to confuse them:
+
+<Tabs>
+  <Tab title="Inter-process segments">
+    Controlled by `pocoma.projection.worker.segment-index` and
+    `pocoma.projection.worker.segment-count`.
+
+    - Determines which **database rows** this process may claim
+      (`pot_partition_hash % segmentCount = segmentIndex`).
+    - Determines which **wake signals** this process acts on.
+    - Each running JVM process owns exactly one inter-process segment.
+    - Changing `segment-count` requires redeploying all worker processes with
+      consistent values; the hash boundaries shift.
+  </Tab>
+  <Tab title="In-process segments">
+    Controlled by `pocoma.projection.worker.thread-count`.
+
+    - Determines how many parallel **segment threads** run inside a single JVM.
+    - Each claimed `potId` is hashed to one of these local threads, preserving
+      per-pot order within the process.
+    - Can be tuned without redeployment if your runtime allows live property
+      overrides.
+    - Default is 10 threads.
+  </Tab>
+</Tabs>
+
+A hot pot belongs to exactly one inter-process partition for a given `segment-count`. Within that process it is always routed to the same local segment thread. This double-layer design keeps per-pot ordering strong without requiring distributed locks.
+
+## When to Modify the Task Executor
+
+You should touch this module if:
+
+- **You need to change balance computation logic.** The calculation lives in `domain-projection` → `PotBalancesCalculator`. It is pure Java with no framework dependencies, so changes are straightforward to unit-test.
+- **You are adding a new projection type.** A new task type requires its own work source, its own use case, and potentially its own executor worker. Use `COMPUTE_BALANCES_FOR_VERSION` as the reference implementation.
+- **You need longer leases for slow projections.** Set `pocoma.projection.worker.task-executor-lease-duration` and optionally `task-executor-heartbeat-interval` to a value that matches your expected computation time.
+- **Queues fill up under load.** Increase `thread-count` or `queue-capacity`, or add more executor processes with a larger `segment-count`.

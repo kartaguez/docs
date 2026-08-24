@@ -1,0 +1,144 @@
+---
+title: "Running Pocoma as a Monolith"
+sidebarTitle: "Monolith"
+description: "Run all Pocoma roles in a single process using runtime-monolith. Supports both H2 (default) and PostgreSQL modes via Spring profiles."
+---
+
+`runtime-monolith` is the all-in-one composition root for Pocoma. It bundles every application role into a single JVM process:
+
+<CardGroup cols={2}>
+  <Card title="HTTP API" icon="globe">
+    REST controllers and DTOs from `supra-http-rest-spring`
+  </Card>
+  <Card title="Task Builder" icon="hammer">
+    Business-event outbox dispatcher that coalesces events into `projection_tasks`
+  </Card>
+  <Card title="Task Executor" icon="bolt">
+    Balance-calculation dispatcher that polls `projection_tasks` and computes balances
+  </Card>
+  <Card title="Spring Event Worker" icon="bell">
+    In-process wake signal listener (`event-listener-enabled=true`) that bridges committed events to the projection pipeline without NATS
+  </Card>
+</CardGroup>
+
+## When to Use the Monolith
+
+<Tip>
+  Use `runtime-monolith` for local development, smoke testing, and architecture
+  experimentation. It reflects the same domain and engine code as the distributed
+  runtimes — only the wiring and number of processes differ.
+</Tip>
+
+The monolith is **not** the target production shape. For horizontal scalability
+and independent scaling of the projection pipeline, use the [dedicated distributed
+runtimes](/runtimes/distributed).
+
+## Available Spring Profiles
+
+| Profile    | Effect                                                                       |
+| ---------- | ---------------------------------------------------------------------------- |
+| *(default)*| H2 in-memory database, Spring event worker enabled, no external dependencies |
+| `postgres` | Switches datasource to PostgreSQL via `POCOMA_POSTGRES_*` env vars           |
+| `api`      | Starts only the HTTP API role (no projection workers)                        |
+| `worker`   | Starts only the projection worker role (no HTTP server)                      |
+
+The `api` and `worker` profiles are available for local experiments inside
+`runtime-monolith`. The dedicated runtimes (`runtime-web-api`,
+`runtime-business-events-outbox-dispatcher`,
+`runtime-balance-calculation-tasks-dispatcher`) match the target deployment shape
+and are preferred for split-mode testing.
+
+---
+
+## H2 Mode (Default)
+
+H2 mode keeps all data in memory. No external services are required. The
+database is reset on every restart.
+
+<Steps>
+  <Step title="Build the monolith">
+    From the `app/` directory, build `runtime-monolith` and all its dependencies,
+    skipping tests for speed:
+
+    ```bash
+    cd app
+    ./mvnw -pl runtime-monolith -am install -DskipTests
+    ```
+  </Step>
+  <Step title="Start the application">
+    Launch the monolith using the default Spring Boot run goal. No profile flag is
+    needed — H2 is the default:
+
+    ```bash
+    ./mvnw -pl runtime-monolith spring-boot:run
+    ```
+
+    The API is available at `http://localhost:8080` once the banner appears.
+  </Step>
+</Steps>
+
+---
+
+## PostgreSQL Mode
+
+PostgreSQL mode uses a real relational database. Flyway manages the schema
+automatically on first boot.
+
+<Steps>
+  <Step title="Start PostgreSQL">
+    A Compose file is included in `app/` for convenience. It starts a single
+    PostgreSQL 16 container:
+
+    ```bash
+    cd app
+    docker compose -f docker-compose.postgres.yml up -d
+    ```
+
+    Default connection details: host `localhost:5432`, database `pocoma`, user
+    `pocoma`, password `pocoma`.
+  </Step>
+  <Step title="Build the monolith">
+    ```bash
+    ./mvnw -pl runtime-monolith -am install -DskipTests
+    ```
+  </Step>
+  <Step title="Start the application with the postgres profile">
+    Pass the `postgres` Spring profile to activate the PostgreSQL datasource:
+
+    ```bash
+    ./mvnw -pl runtime-monolith spring-boot:run \
+      -Dspring-boot.run.profiles=postgres
+    ```
+  </Step>
+</Steps>
+
+<Note>
+  In PostgreSQL mode, Hibernate validates the schema against the Flyway-managed
+  tables. A schema mismatch will prevent startup and show a descriptive error in
+  the logs.
+</Note>
+
+---
+
+## Verifying the Application
+
+Once the monolith is running, confirm it is healthy:
+
+```bash
+# Check the Spring Boot actuator health endpoint
+curl http://localhost:8080/actuator/health
+
+# Confirm Prometheus metrics are being published
+curl -s http://localhost:8080/actuator/prometheus | grep pocoma_projection
+```
+
+Useful local endpoints:
+
+| Endpoint                              | Description                   |
+| ------------------------------------- | ----------------------------- |
+| `http://localhost:8080`               | Pocoma REST API               |
+| `http://localhost:8080/actuator/health` | Spring Boot health indicator |
+| `http://localhost:8080/actuator/prometheus` | Prometheus metrics scrape |
+
+For full observability with Prometheus and Grafana pre-wired, use the
+[Docker Compose monolith modes](/runtimes/docker-compose) instead.

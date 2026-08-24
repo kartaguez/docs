@@ -1,0 +1,168 @@
+---
+title: "Docker Compose Deployment Modes for Pocoma"
+sidebarTitle: "Docker Compose"
+description: "Three root-level Compose files let you run Pocoma locally as a monolith with H2, a monolith with PostgreSQL, or a distributed stack with NATS and multiple workers."
+---
+
+The repository root contains three Docker Compose files, each representing a
+complete, self-contained deployment topology. All files build the Java runtimes
+from source using the `app/Dockerfile`.
+
+<Warning>
+  Run **only one mode at a time**. All three Compose files publish the same local
+  ports — API on `8080`, Prometheus on `9090`, and Grafana on `3000`. Starting a
+  second stack while another is running will cause port conflicts.
+</Warning>
+
+---
+
+## The Three Compose Files
+
+<CardGroup cols={1}>
+  <Card title="docker-compose.monolith-h2.yml" icon="database">
+    **Monolith with in-memory H2.** Starts a single `runtime-monolith` container
+    with no external database. The Spring event worker runs in-process. Prometheus
+    and Grafana are pre-wired. All data is lost on container restart.
+
+    Includes: monolith · H2 (in-memory) · Spring event worker · Prometheus ·
+    Grafana
+  </Card>
+  <Card title="docker-compose.monolith-postgres.yml" icon="elephant">
+    **Monolith with PostgreSQL.** Same `runtime-monolith` image, but the
+    `postgres` Spring profile is active and an external PostgreSQL 16 container
+    holds durable state. Flyway runs the schema migration on first boot. Prometheus
+    and Grafana are pre-wired.
+
+    Includes: monolith · PostgreSQL 16 · Spring event worker · Prometheus · Grafana
+  </Card>
+  <Card title="docker-compose.distributed.yml" icon="network-wired">
+    **Distributed mode.** One API runtime, two business-event task-builder
+    workers (segments 0 and 1), two balance-calculation task-executor workers
+    (segments 0 and 1), PostgreSQL, NATS, Prometheus, and Grafana. Each dispatcher
+    service uses `POCOMA_PROJECTION_WORKER_SEGMENT_INDEX` and
+    `POCOMA_PROJECTION_WORKER_SEGMENT_COUNT=2`.
+
+    Includes: runtime-web-api · 2× business-events-outbox-dispatcher · 2×
+    balance-calculation-tasks-dispatcher · PostgreSQL 16 · NATS 2 · Prometheus ·
+    Grafana
+  </Card>
+</CardGroup>
+
+---
+
+## Port Reference
+
+| Service    | Host Port | Notes                            |
+| ---------- | --------- | -------------------------------- |
+| Pocoma API | `8080`    | Overridable via `API_PORT`       |
+| Prometheus | `9090`    | Scrapes `/actuator/prometheus`   |
+| Grafana    | `3000`    | Login: `admin` / `admin`         |
+| PostgreSQL | `5432`    | PostgreSQL and distributed modes |
+| NATS       | `4222`    | Distributed mode only            |
+| NATS monitoring | `8222` | Distributed mode only          |
+
+---
+
+## Starting Each Mode
+
+<Steps>
+  <Step title="Monolith with H2 (no external dependencies)">
+    Build and start the monolith with an in-memory H2 database:
+
+    ```bash
+    docker compose -f docker-compose.monolith-h2.yml up --build
+    ```
+
+    Grafana and Prometheus start automatically and are pre-configured to scrape the monolith.
+  </Step>
+
+  <Step title="Monolith with PostgreSQL">
+    Build and start the monolith backed by a persistent PostgreSQL database:
+
+    ```bash
+    docker compose -f docker-compose.monolith-postgres.yml up --build
+    ```
+
+    PostgreSQL is health-checked before the monolith starts. Flyway runs the
+    schema migration on first boot.
+  </Step>
+
+  <Step title="Distributed mode">
+    Build and start the full distributed stack — API, two task builders, two task
+    executors, PostgreSQL, NATS, Prometheus, and Grafana:
+
+    ```bash
+    docker compose -f docker-compose.distributed.yml up --build
+    ```
+
+    Workers with the `-0` suffix own segment `0/2`; workers with the `-1` suffix
+    own segment `1/2`. Each worker only claims database rows whose
+    `pot_partition_hash % 2` matches its index.
+  </Step>
+</Steps>
+
+---
+
+## Stopping and Switching Modes
+
+Always stop the current stack before starting a different one:
+
+<CodeGroup>
+  ```bash Stop H2 monolith
+  docker compose -f docker-compose.monolith-h2.yml down
+  ```
+
+  ```bash Stop PostgreSQL monolith
+  docker compose -f docker-compose.monolith-postgres.yml down
+  ```
+
+  ```bash Stop distributed stack
+  docker compose -f docker-compose.distributed.yml down
+  ```
+</CodeGroup>
+
+To remove volumes (including the PostgreSQL data directory) when switching from
+the PostgreSQL monolith or distributed mode:
+
+```bash
+docker compose -f docker-compose.monolith-postgres.yml down -v
+```
+
+<Note>
+  The H2 monolith stores no persistent volumes — `down` alone is sufficient.
+</Note>
+
+---
+
+## Optional Environment Overrides
+
+All three Compose files respect the following environment variables. Set them
+in your shell before running `docker compose up`, or place them in a `.env` file
+at the repository root.
+
+| Variable                | Default              | Description                                             |
+| ----------------------- | -------------------- | ------------------------------------------------------- |
+| `POSTGRES_DB`           | `pocoma`             | PostgreSQL database name                                |
+| `POSTGRES_USER`         | `pocoma`             | PostgreSQL username                                     |
+| `POSTGRES_PASSWORD`     | `pocoma`             | PostgreSQL password                                     |
+| `API_PORT`              | `8080`               | Host port mapped to the Pocoma API container            |
+| `NATS_URL`              | `nats://nats:4222`   | NATS server URL used by dispatcher runtimes (distributed mode) |
+| `POCOMA_SEGMENT_COUNT`  | `2`                  | Number of inter-process worker segments (distributed mode) |
+
+Example — run the distributed stack with a higher segment count and a custom API port:
+
+```bash
+API_PORT=9000 POCOMA_SEGMENT_COUNT=4 \
+  docker compose -f docker-compose.distributed.yml up --build
+```
+
+---
+
+## Useful Endpoints (All Modes)
+
+| Endpoint                                 | Description                     |
+| ---------------------------------------- | ------------------------------- |
+| `http://localhost:8080`                  | Pocoma REST API                 |
+| `http://localhost:8080/actuator/prometheus` | Prometheus metrics scrape    |
+| `http://localhost:9090`                  | Prometheus UI                   |
+| `http://localhost:3000`                  | Grafana dashboards (`admin` / `admin`) |

@@ -1,0 +1,162 @@
+---
+title: "Projection Task Builder: From Business Events to Tasks"
+sidebarTitle: "Task Builder"
+description: "The task builder worker polls the business_event_outbox, coalesces events per pot into COMPUTE_BALANCES_FOR_VERSION tasks, and signals task executors via wake events."
+---
+
+## What the Task Builder Does
+
+The task builder is the **first stage** of Pocoma's projection pipeline. It bridges the gap between the command side (which writes to `business_event_outbox`) and the execution side (which reads from `projection_tasks`).
+
+Its responsibilities are:
+
+1. Wake on a `BUSINESS_EVENTS_AVAILABLE` signal or a polling timeout.
+2. Claim a batch of pending outbox rows for its hash segment.
+3. Pass each claimed event to `BuildProjectionTasksUseCase`.
+4. For each balance-impacting event, create or coalesce a `COMPUTE_BALANCES_FOR_VERSION` task in `projection_tasks`.
+5. Mark the outbox row `PROCESSED` and publish a `PROJECTION_TASKS_AVAILABLE(potId)` wake signal.
+
+## Module and Runtime
+
+| Concern | Artifact |
+|---|---|
+| Implementation module | `app/supra-dispatcher-business-events-outbox-nats` |
+| Spring Boot runtime | `app/runtime-business-events-outbox-dispatcher` |
+
+The Spring profile `postgres` must be active for this runtime to connect to PostgreSQL. Segment assignment is controlled by `pocoma.projection.worker.segment-index` and `pocoma.projection.worker.segment-count`.
+
+## Step-by-Step Flow
+
+<Steps>
+  <Step title="Wake">
+    The worker waits for a `BUSINESS_EVENTS_AVAILABLE(potId)` signal **for its
+    own partition** or for `task-builder-polling-interval` (default 250 ms),
+    whichever comes first. In monolith mode, the signal is a Spring
+    `ApplicationEvent`. In split mode, it arrives over NATS on
+    `pocoma.projection.business-events.available`.
+  </Step>
+  <Step title="Claim batch">
+    The supra dispatcher calls `BusinessEventWorkSource`, which issues a
+    `SELECT … FOR UPDATE SKIP LOCKED` filtered by
+    `pot_partition_hash % segmentCount = segmentIndex`. Up to
+    `task-builder-batch-size` rows (default 100) move from `PENDING` to
+    `CLAIMED`. Each claim writes a fresh random `claim_token` and sets
+    `lease_until = now() + task-builder-lease-duration`.
+  </Step>
+  <Step title="ACCEPTED and RUNNING transitions">
+    For each claimed row the supra worker marks the row `ACCEPTED` (ownership
+    confirmed locally), then `RUNNING` (computation started). Both transitions
+    validate the `claim_token` — a stale worker whose lease expired cannot
+    advance a row it no longer owns.
+  </Step>
+  <Step title="BuildProjectionTasksUseCase">
+    The engine use case receives the business event envelope and calls
+    `JpaProjectionTaskAdapter` to create or coalesce the corresponding
+    `COMPUTE_BALANCES_FOR_VERSION` task. If a task for the same `potId` already
+    exists in `PENDING` status, only `target_version` is raised; no new row is
+    inserted.
+  </Step>
+  <Step title="PROCESSED and wake signal">
+    The supra worker marks the outbox row `PROCESSED`. After at least one task
+    was created or coalesced, it publishes `PROJECTION_TASKS_AVAILABLE(potId)`.
+    In split mode this signal is forwarded to NATS on
+    `pocoma.projection.tasks.available`.
+  </Step>
+  <Step title="Failure and release">
+    If `BuildProjectionTasksUseCase` throws, the supra worker marks the row
+    `FAILED`. If the worker loses ownership before reaching the `RUNNING`
+    transition (lease expired, process restart), or if the local queue refuses
+    admission, the row is released back to `PENDING` so another worker can
+    claim it.
+  </Step>
+</Steps>
+
+## The `business_event_outbox` Table
+
+Every balance-impacting command writes one row here inside the same ACID transaction as the business state update.
+
+| Field | Description |
+|---|---|
+| `event_type` | The type of business event (e.g., `EXPENSE_CREATED`, `PARTICIPANT_ADDED`). |
+| `pot_id` | The pot this event belongs to. |
+| `aggregate_id` | The aggregate root ID (typically equal to `pot_id`). |
+| `version` | The pot version at the time the event was emitted. |
+| `payload_json` | Full event payload in JSON. |
+| `pot_partition_hash` | Stable hash of `pot_id`; used to route this row to the correct worker segment. |
+| `status` | Lifecycle status (see below). |
+| `claim_token` | Random fencing token written at claim time. Required on all subsequent transitions. |
+| `claimed_by` | Diagnostic worker ID. Informational only — ownership is enforced by `claim_token`. |
+| `lease_until` | Timestamp after which another worker may reclaim this row. |
+| `trace_id` | HTTP request trace ID propagated into projection metrics. |
+| `command_committed_at_nanos` | Nanosecond timestamp of the command commit; used to compute end-to-end projection latency. |
+
+### Status Lifecycle
+
+```text
+PENDING
+  │
+  ▼ worker claims (writes claim_token + lease_until)
+CLAIMED
+  │
+  ▼ worker confirms local ownership
+ACCEPTED
+  │
+  ▼ use case begins
+RUNNING
+  │
+  ├─▶ PROCESSED  (task created/coalesced successfully)
+  └─▶ FAILED     (use case threw after max-retries)
+
+Any state before RUNNING → PENDING  (lease expired or admission refused)
+```
+
+<Note>
+  A row stuck in `CLAIMED` or `ACCEPTED` past its `lease_until` timestamp will
+  be reclaimed by the next polling cycle. This is normal behavior after a
+  worker restart or crash.
+</Note>
+
+## Claim Token and Lease Fencing
+
+Every worker claim writes a new random `claim_token`. All downstream status transitions require the token to match:
+
+```sql
+UPDATE business_event_outbox
+SET    status      = 'PROCESSED',
+       claim_token = NULL
+WHERE  id          = ?
+  AND  claim_token = ?   -- stale workers fail here
+```
+
+If a worker pauses (e.g., a long GC pause or network partition) and its lease expires, another worker reclaims the row with a new token. When the original worker resumes and attempts its `PROCESSED` transition, the token no longer matches and the update silently affects zero rows. The supra dispatcher detects this and does not mark the local task done.
+
+Leases are intentionally short (default 30 s) and renewable. For projections that take longer, add periodic heartbeat calls — the table semantics do not change.
+
+## Segmentation
+
+Multiple task-builder processes can run in parallel without conflicting by owning disjoint hash segments of `pot_partition_hash`:
+
+```text
+Process A: segment-index=0, segment-count=2
+  → claims rows where pot_partition_hash % 2 = 0
+
+Process B: segment-index=1, segment-count=2
+  → claims rows where pot_partition_hash % 2 = 1
+```
+
+A pot belongs to exactly one segment for a given `segment-count`, so it is always claimed by the same logical worker group. Wake signals carry `potId` and are filtered locally: a worker only acts on signals for pots in its own partition.
+
+<Tip>
+  Start with `segment-count=1` (the default). Add segments when
+  `pocoma_projection_outbox_pending` stays elevated under load. Each new
+  segment is a separate JVM process running
+  `runtime-business-events-outbox-dispatcher`.
+</Tip>
+
+## When to Modify the Task Builder
+
+You should touch this module if:
+
+- **A new business event type should trigger a projection.** Add handling in `BuildProjectionTasksUseCase` to map the new event type to a `COMPUTE_BALANCES_FOR_VERSION` task (or a new task type if the calculation is independent).
+- **You need a different coalescing strategy.** For example, if a new event type must always produce a fresh task rather than raising `target_version`, extend `JpaProjectionTaskAdapter` and `BuildProjectionTasksUseCase` accordingly.
+- **You want to change batch size or lease duration at runtime.** These are `pocoma.projection.worker` properties — see the [Configuration](/projection/configuration) page.

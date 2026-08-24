@@ -1,0 +1,130 @@
+---
+title: "Authenticating Requests to the Pocoma API"
+sidebarTitle: "Authentication"
+description: "Pocoma identifies callers through the X-User-Id request header. Every API request must include this header; requests without it are rejected with 400."
+---
+
+## How Authentication Works
+
+Pocoma does not issue tokens, manage credentials, or integrate with an OAuth provider. Instead, it trusts your infrastructure to tell it who the caller is via two HTTP request headers that must be set on every request:
+
+| Header | Required | Description |
+|---|---|---|
+| `X-User-Id` | **Yes** | UUID identifying the calling user. Must be a valid UUID string. |
+| `X-User-Scopes` | **Yes** | Semicolon-separated list of scope strings authorising the operation (e.g. `pot:read;pot:create`). |
+
+The values of these headers are controlled entirely by your system — your API gateway, reverse proxy, or test harness sets them. Pocoma does not verify signatures or expiry; it reads, parses, and enforces them.
+
+<Note>
+`X-User-Id` must be a valid UUID (e.g. `22222222-2222-2222-2222-222222222222`). Passing a non-UUID string results in a `400 Bad Request` with error code `INVALID_USER_ID`.
+</Note>
+
+---
+
+## Sending the Headers
+
+Include both headers on every request:
+
+```bash
+curl -X POST http://localhost:8080/api/pots \
+  -H "X-User-Id: 22222222-2222-2222-2222-222222222222" \
+  -H "X-User-Scopes: pot:create" \
+  -H "Content-Type: application/json" \
+  -d '{"label": "Trip to Barcelona"}'
+```
+
+Multiple scopes are separated by semicolons:
+
+```bash
+curl http://localhost:8080/api/pots \
+  -H "X-User-Id: 22222222-2222-2222-2222-222222222222" \
+  -H "X-User-Scopes: pot:read;pot:create"
+```
+
+---
+
+## What Happens Without the Header
+
+If `X-User-Id` is missing or blank, the request is rejected immediately with `400 Bad Request` before any business logic runs:
+
+```bash
+curl -X POST http://localhost:8080/api/pots \
+  -H "Content-Type: application/json" \
+  -d '{"label": "Trip to Barcelona"}'
+```
+
+```json
+{
+  "code": "MISSING_USER_ID",
+  "message": "X-User-Id header is required",
+  "status": 400,
+  "path": "/api/pots"
+}
+```
+
+If `X-User-Scopes` is missing or blank, you also receive a `400`:
+
+```json
+{
+  "code": "MISSING_USER_SCOPES",
+  "message": "X-User-Scopes header is required",
+  "status": 400,
+  "path": "/api/pots"
+}
+```
+
+---
+
+## Error Response Format
+
+All API errors — including authentication errors — share a single JSON envelope:
+
+```json
+{
+  "code": "MISSING_USER_ID",
+  "message": "X-User-Id header is required",
+  "status": 400,
+  "path": "/api/pots"
+}
+```
+
+<ResponseField name="code" type="string" required>
+  A machine-readable error code string. Use this for programmatic error handling.
+</ResponseField>
+
+<ResponseField name="message" type="string" required>
+  A human-readable description of the error.
+</ResponseField>
+
+<ResponseField name="status" type="integer" required>
+  The HTTP status code echoed in the body (e.g. `400`, `404`, `409`).
+</ResponseField>
+
+<ResponseField name="path" type="string" required>
+  The request URI that produced the error.
+</ResponseField>
+
+---
+
+## Common Error Codes
+
+| Code | HTTP Status | Cause |
+|---|---|---|
+| `MISSING_USER_ID` | 400 | `X-User-Id` header is absent or blank |
+| `INVALID_USER_ID` | 400 | `X-User-Id` value is not a valid UUID |
+| `MISSING_USER_SCOPES` | 400 | `X-User-Scopes` header is absent or blank |
+| `INVALID_USER_SCOPES` | 400 | `X-User-Scopes` contains an unrecognised scope string |
+| `MISSING_HEADER` | 400 | A different required header is absent (Spring binding layer) |
+| `INVALID_REQUEST` | 400 | Malformed request body, wrong argument type, or null where a value is required |
+| `POT_VERSION_CONFLICT` | 409 | `expectedVersion` did not match the pot's current version |
+| `INTERNAL_ERROR` | 500 | Unexpected server-side error |
+
+<Tip>
+In automated tests and local development, use a fixed UUID such as `22222222-2222-2222-2222-222222222222` for `X-User-Id`. In production, your API gateway should inject the authenticated user's UUID before forwarding to Pocoma.
+</Tip>
+
+---
+
+## Design Note
+
+Pocoma intentionally separates identity resolution from business logic. The application never issues or validates tokens — it assumes your infrastructure layer has already authenticated the caller and is forwarding a trusted user identity via headers. This keeps the domain model free of authentication dependencies and makes the API straightforward to test without mocking an auth server.

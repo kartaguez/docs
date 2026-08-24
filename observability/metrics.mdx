@@ -1,0 +1,168 @@
+---
+title: "Prometheus Metrics Exposed by Pocoma"
+sidebarTitle: "Metrics"
+description: "Pocoma exposes Prometheus metrics for command latency, projection pipeline backlog, worker retry rates, and end-to-end projection lag via /actuator/prometheus."
+---
+
+Pocoma exposes Prometheus metrics through the standard Spring Boot Actuator
+endpoint. These metrics are designed to make the main risk of asynchronous
+projection — temporary lag — **visible and measurable** rather than hidden.
+
+## Metrics Endpoint
+
+```text
+http://localhost:8080/actuator/prometheus
+```
+
+Prometheus scrapes this endpoint on every mode: H2 monolith, PostgreSQL
+monolith, and distributed. The [Docker Compose stacks](/runtimes/docker-compose)
+pre-configure Prometheus to target the API container automatically.
+
+---
+
+## Grafana Dashboard
+
+A pre-provisioned Grafana dashboard is included in `docker/grafana/` and loaded
+automatically by all Docker Compose stacks.
+
+```text
+http://localhost:3000   (admin / admin)
+```
+
+The dashboard surfaces projection pipeline health at a glance: backlog trends,
+latency percentiles, retry rates, and version-gap distributions.
+
+---
+
+## Key Metrics
+
+### Pipeline Queue Depth
+
+| Metric Name | Description |
+|---|---|
+| `pocoma_projection_outbox_pending` | Business events in `business_event_outbox` with status `PENDING` or `CLAIMED` — work waiting for a task-builder worker to process it |
+| `pocoma_projection_tasks_pending` | Projection tasks in `projection_tasks` with status `PENDING` or in progress — work waiting for a balance-calculation worker |
+
+A healthy system shows these gauges rising during command bursts and draining
+to zero shortly after load stops. A gauge that never drains indicates a worker
+capacity or failure problem.
+
+### Latency and Timing
+
+| Metric Name | Description |
+|---|---|
+| Command persistence latency | Time from receiving an HTTP command to committing the business state and outbox row — measures API responsiveness under load |
+| Delay between command commit and worker processing start | Time from `command_committed_at_nanos` (stored in `business_event_outbox`) to the moment a worker begins processing — the queue-wait component of projection lag |
+| Projection processing duration | Wall time a worker spends executing a single `COMPUTE_BALANCES_FOR_VERSION` task |
+| End-to-end latency | Time from persisted command to persisted projection — the full observable lag a client experiences between writing and reading consistent balances |
+
+### Version Gap Distribution
+
+The distribution of gaps between the current pot version (latest command) and
+the highest version that has been fully projected. A spike in gap values
+indicates that workers are falling behind the write rate. The metric reverts to
+zero as workers catch up.
+
+### Retries and Failures
+
+| Metric Name | Description |
+|---|---|
+| Retry count | Number of times the worker pool retried a task before marking it `DONE` or `FAILED` |
+| Failure count | Tasks or outbox rows that exhausted retries and were marked `FAILED` |
+
+<Warning>
+  If `FAILED` rows accumulate and are not retried, inspect the database directly.
+  A failed outbox row or projection task stays in its terminal state until
+  manually re-queued or the lease expires and another worker reclaims it.
+</Warning>
+
+---
+
+## k6 Load Test Scripts
+
+The `scripts/k6/` directory contains three load test scenarios designed to
+exercise concurrency and projection behavior. All scripts create their own
+`K6`-prefixed test data and scrape `/actuator/prometheus` during the run.
+
+<CardGroup cols={3}>
+  <Card title="smoke.js" icon="vial">
+    **Basic flow validation.** Short-duration run that confirms valid commands,
+    concurrent version conflicts (`409`), incoherent requests, and Prometheus
+    scraping all behave correctly.
+  </Card>
+  <Card title="stress.js" icon="chart-line">
+    **Concurrency and conflict stress.** Progressive ramp-up with a mix of ~70%
+    valid commands, ~20% concurrent conflicts, and ~10% incoherent requests.
+    Measures command latency under sustained concurrency.
+  </Card>
+  <Card title="projection_backpressure.js" icon="gauge-high">
+    **Burst load and projection lag.** Generates command bursts on hot and
+    distributed pots while continuously reading balances and scraping backlog
+    metrics. Designed to validate that `pocoma_projection_outbox_pending` and
+    `pocoma_projection_tasks_pending` drain after the burst ends.
+  </Card>
+</CardGroup>
+
+### k6 Metrics Published During Runs
+
+The scripts expose the following k6 custom metrics in addition to the built-in
+`http_req_duration` and `http_req_failed` counters:
+
+| k6 Metric | Description |
+|---|---|
+| `pocoma_command_http_duration` | HTTP duration of command requests, tagged by `operation` |
+| `pocoma_command_failure_total` | Unexpected command responses or network failures |
+| `pocoma_expected_failure_total` | Intentional failures from conflict / incoherent scenarios |
+| `pocoma_unexpected_failure_rate` | Rate of failures that should not occur |
+| `pocoma_prometheus_scrape_success` | Whether each Actuator scrape succeeded |
+
+The scraper also converts Prometheus application metrics into k6 trend metrics
+sampled as delta `sum/count` between scrape intervals:
+
+| Observed k6 Metric | Source Prometheus Metric |
+|---|---|
+| `pocoma_observed_command_persist_latency` | Command persistence latency histogram |
+| `pocoma_observed_projection_event_start_latency` | Delay between commit and worker start |
+| `pocoma_observed_projection_processing_duration` | Per-task processing time |
+| `pocoma_observed_projection_end_to_end_latency` | Full command-to-projection lag |
+| `pocoma_observed_projection_gap_ratio` | Version gap distribution |
+| `pocoma_observed_projection_retry_total` | Worker retry counter |
+| `pocoma_observed_projection_outbox_pending` | Outbox backlog gauge |
+| `pocoma_observed_projection_tasks_pending` | Task backlog gauge |
+
+### Running the Backpressure Scenario
+
+The `projection_backpressure.js` scenario is the most useful for validating
+distributed worker behaviour. Run it while multiple dispatcher processes own
+different `segment-index` values:
+
+```bash
+cd app
+BASE_URL=http://localhost:8080 \
+SEED_POTS=8 \
+HOT_POTS=2 \
+BACKPRESSURE_PEAK_RATE=60 \
+BACKPRESSURE_PLATEAU=1m \
+SCRAPE_INTERVAL_SECONDS=2 \
+k6 run ../scripts/k6/projection_backpressure.js
+```
+
+| Variable | Default | Description |
+|---|---|---|
+| `BASE_URL` | `http://localhost:8080` | Pocoma API base URL |
+| `SEED_POTS` | `8` | Total pots seeded before the burst |
+| `HOT_POTS` | `2` | Number of pots receiving concentrated write load |
+| `BACKPRESSURE_PEAK_RATE` | `60` | Peak command rate per second during the burst |
+| `BACKPRESSURE_PLATEAU` | `1m` | Duration of the burst plateau |
+| `SCRAPE_INTERVAL_SECONDS` | `2` | How often to scrape `/actuator/prometheus` |
+
+A healthy run shows command latency staying bounded while the backlog rises
+during the burst and drains cleanly after load stops. With multiple workers,
+each worker should only claim rows belonging to its `pot_partition_hash` segment,
+and hot pots should not wake unrelated worker segments.
+
+<Tip>
+  If `pocoma_observed_projection_tasks_pending` does not drain after load stops,
+  increase worker capacity (`thread-count`, `queue-capacity`), add more worker
+  segments, or inspect `FAILED` rows in the `projection_tasks` table.
+</Tip>

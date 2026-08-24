@@ -1,0 +1,122 @@
+{
+  "projectType": "api-service",
+  "projectName": "Pocoma",
+  "projectDescription": "A Spring Boot REST API for managing shared expense pots: participants record expenses, the system computes balances via an asynchronous projection pipeline, and an optimistic-concurrency model ensures consistent writes.",
+  "theme": "luma",
+  "primaryColor": "#2563EB",
+  "lightColor": "#DBEAFE",
+  "darkColor": "#1E3A8A",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Developer Guide",
+        "groups": [
+          {
+            "group": "Overview",
+            "pages": [
+              "introduction",
+              "architecture-overview",
+              "module-map"
+            ]
+          },
+          {
+            "group": "Core Layers",
+            "pages": [
+              "layers/domain",
+              "layers/engine",
+              "layers/infra",
+              "layers/supra"
+            ]
+          },
+          {
+            "group": "Projection Pipeline",
+            "pages": [
+              "projection/overview",
+              "projection/task-builder",
+              "projection/task-executor",
+              "projection/wake-signals",
+              "projection/configuration"
+            ]
+          },
+          {
+            "group": "Runtime Modes",
+            "pages": [
+              "runtimes/monolith",
+              "runtimes/distributed",
+              "runtimes/docker-compose"
+            ]
+          },
+          {
+            "group": "Observability",
+            "pages": [
+              "observability/metrics",
+              "observability/tracing"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Getting Started",
+            "pages": [
+              "api/authentication",
+              "api/versioning"
+            ]
+          },
+          {
+            "group": "Pots",
+            "pages": [
+              "api/pots/commands",
+              "api/pots/queries"
+            ]
+          },
+          {
+            "group": "Expenses",
+            "pages": [
+              "api/expenses/commands",
+              "api/expenses/queries"
+            ]
+          },
+          {
+            "group": "Balances",
+            "pages": [
+              "api/balances"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Shared pot management with versioned optimistic concurrency",
+    "Expense tracking with weighted shareholder splits",
+    "Asynchronous balance projection pipeline with durable database queues",
+    "Segmented, partitioned projection workers for horizontal scalability",
+    "Hexagonal architecture separating domain, engine, infra, and HTTP layers",
+    "NATS-based wake signals for low-latency projection processing",
+    "Monolith and distributed runtime deployment modes",
+    "Prometheus metrics and distributed trace propagation",
+    "Generic claimable-work dispatcher (orchestrator-claimable-work-dispatcher)",
+    "Flyway-managed PostgreSQL schema with H2 fallback for local development"
+  ],
+  "publicApiSurface": [
+    "POST   /api/pots                              — Create a pot",
+    "PATCH  /api/pots/{potId}/details              — Update pot details",
+    "DELETE /api/pots/{potId}                      — Delete a pot",
+    "POST   /api/pots/{potId}/shareholders         — Add shareholders",
+    "PATCH  /api/pots/{potId}/shareholders/details — Update shareholder details",
+    "PATCH  /api/pots/{potId}/shareholders/weights — Update shareholder weights",
+    "POST   /api/pots/{potId}/expenses             — Create an expense",
+    "PATCH  /api/expenses/{expenseId}/details      — Update expense details",
+    "PATCH  /api/expenses/{expenseId}/shares       — Update expense shares",
+    "DELETE /api/expenses/{expenseId}              — Delete an expense",
+    "GET    /api/pots                              — List accessible pots",
+    "GET    /api/pots/{potId}                      — Get a pot (optionally at version)",
+    "GET    /api/pots/{potId}/expenses             — List pot expenses (optionally at version)",
+    "GET    /api/pots/{potId}/balances             — Get pot balances (optionally at version)",
+    "GET    /api/pots/balances/me                  — List current user's balances across all pots",
+    "GET    /api/expenses/{expenseId}              — Get an expense (optionally at version)"
+  ]
+}

@@ -1,0 +1,176 @@
+---
+title: "Infrastructure Layer: Persistence and Adapters"
+sidebarTitle: "Infrastructure"
+description: "The infra modules implement the engine's outbound ports: JPA adapters for H2/PostgreSQL, transaction management, and Spring event publishing."
+---
+
+The infrastructure layer contains the concrete implementations of every outbound port defined in the engine. It is the only place in the codebase that is allowed to import JPA annotations, Spring transaction APIs, or JDBC driver classes. By design, the engine and domain modules never reference these modules; the dependency arrow always points inward.
+
+<Note>
+Infrastructure modules implement engine port interfaces. They are wired together in the runtime composition roots (`runtime-monolith`, `runtime-web-api`, etc.) using Spring's dependency injection. The engine services are completely unaware of which adapter is plugged in.
+</Note>
+
+---
+
+## Module layout
+
+```
+app/
+  infra-persistence-jpa/         JPA adapters for all outbound persistence ports
+  infra-tx-spring/               Spring @Transactional adapter for TransactionRunner
+  infra-event-publisher-spring/  Spring ApplicationEvent publisher + outbox writer
+```
+
+---
+
+## `infra-persistence-jpa`
+
+This module provides all concrete JPA adapters. Each adapter implements one or more outbound port interfaces from the engine and translates between domain types and JPA entity classes.
+
+### Core adapters
+
+| Adapter | Port(s) implemented | Responsibility |
+|---|---|---|
+| `JpaPotGlobalVersionAdapter` | `PotGlobalVersionPort` | Save and CAS-update the per-pot version counter |
+| `JpaPotHeaderAdapter` | `PotHeaderPort` | Save new or replace versioned `PotHeader` rows |
+| `JpaPotShareholdersAdapter` | `PotShareholdersPort` | Save new and updated `Shareholder` rows |
+| `JpaExpenseHeaderAdapter` | `ExpenseHeaderPort` | Save new or replace versioned `ExpenseHeader` rows |
+| `JpaExpenseSharesAdapter` | `ExpenseSharesPort` | Save expense share distributions |
+
+### Context adapters
+
+| Adapter | Port(s) implemented | Responsibility |
+|---|---|---|
+| `JpaPotContextAdapter` | `PotContextPort` | Load pre-command context (version, creator, deleted flag) for all pot command types |
+| `JpaExpenseContextAdapter` | `ExpenseContextPort` | Load pre-command context for all expense command types |
+
+### Query adapters
+
+| Adapter | Port(s) implemented | Responsibility |
+|---|---|---|
+| `JpaPotQueryAdapter` | `PotQueryPort` | Read-side pot, shareholder, and balance queries |
+| `JpaExpenseQueryAdapter` | `ExpenseQueryPort` | Read-side expense queries |
+
+### Outbox and projection adapters
+
+| Adapter | Port(s) implemented | Responsibility |
+|---|---|---|
+| `JpaBusinessEventOutboxAdapter` | `BusinessEventOutboxAppendPort`, `BusinessEventOutboxPort` | Write events to `business_event_outbox`; claim and acknowledge them for task builder workers |
+| `JpaProjectionTaskAdapter` | `ProjectionTaskPort` | Write, claim, and acknowledge rows in `projection_tasks` |
+| `JpaProjectedExpenseAdapter` | `ProjectedExpensePort` | Load the expense snapshots used by `PotBalancesCalculator` |
+| `JpaPotBalancesAdapter` | `PotBalancesPort` | Read and write the computed per-shareholder `Balance` projections |
+
+### Pipeline adapters
+
+| Adapter | Port(s) implemented | Responsibility |
+|---|---|---|
+| `JpaPipelineMaterializationAdapter` | `TaskMaterializationPort` | Persist pipeline materialization state |
+| `JpaPipelineTaskWorkSourceAdapter` | — | Provides claimable pipeline task work items |
+| `JpaMaterializableEventSourceAdapter` | — | Provides claimable business event items for materialization |
+
+### Observability adapter
+
+`JpaProjectionLagAdapter` measures and stores the timestamp gap between when a business event is committed and when the corresponding balance projection is persisted. This feeds the Prometheus projection-lag metric.
+
+### Database schema
+
+Flyway is the source of truth for the PostgreSQL schema. Migration scripts live in `infra-persistence-jpa/src/main/resources/db/migration`. In PostgreSQL mode Hibernate validates the schema against the migrations; it does not auto-create or auto-alter tables.
+
+Key tables:
+
+| Table | Purpose |
+|---|---|
+| `pot_global_version` | Single-row per pot; holds the current version number used for optimistic locking |
+| `pot_header` | Versioned pot metadata; one row per (pot, version) pair |
+| `shareholder` | Pot participants; one row per shareholder |
+| `expense_header` | Versioned expense metadata |
+| `expense_share` | Per-shareholder weight distribution for each expense |
+| `business_event_outbox` | Transactional outbox for business events; claimed by task-builder workers |
+| `projection_task` | Work items for balance calculation; claimed by task-executor workers |
+| `pot_balance_projection_state` | Latest computed balance version per pot |
+| `pot_balance` | Per-shareholder balance rows for the latest computed version |
+
+<Tip>
+H2 is the default database and uses Hibernate's `validate` strategy in tests (or `create-drop` for in-process test mode). PostgreSQL is activated with the `postgres` Spring profile. You never need to switch the JPA adapter; only the `spring.datasource.*` properties change.
+</Tip>
+
+### Activating PostgreSQL
+
+Start the application with:
+
+```bash
+./mvnw -pl runtime-monolith spring-boot:run -Dspring-boot.run.profiles=postgres
+```
+
+Or via Docker Compose:
+
+```bash
+docker compose -f docker-compose.monolith-postgres.yml up --build
+```
+
+<Warning>
+H2 keeps data in memory and resets on restart. Switch to the `postgres` profile for any test that requires data durability across restarts or involves multiple JVM processes (split API/worker mode).
+</Warning>
+
+---
+
+## `infra-tx-spring`
+
+This module provides `SpringTransactionRunner`, the sole implementation of the engine's `TransactionRunner` port.
+
+```java
+public class SpringTransactionRunner implements TransactionRunner {
+
+    @Override
+    public <T> T runInTransaction(Supplier<T> action) {
+        return transactionTemplate.execute(status -> action.get());
+    }
+
+    @Override
+    public void runAfterCommit(Runnable action) {
+        // Registers a TransactionSynchronization so the action runs
+        // only after the current transaction successfully commits.
+        TransactionSynchronizationManager.registerSynchronization(
+            new TransactionSynchronization() {
+                @Override public void afterCommit() { action.run(); }
+            });
+    }
+}
+```
+
+The engine's `TransactionalXxxUseCase` wrappers call `runInTransaction` to ensure every command is atomic. The event publisher uses `runAfterCommit` to fire Spring `ApplicationEvent` notifications only after the database transaction has committed — preventing workers from reading state that was never actually persisted.
+
+<Note>
+`SpringTransactionRunner` delegates to a `TransactionTemplate`, not to a `@Transactional`-annotated method. This means the transaction boundary is explicit in code rather than implicit via proxying, and it works correctly when the engine services are called from non-Spring-managed contexts (e.g. unit tests with manual wiring).
+</Note>
+
+---
+
+## `infra-event-publisher-spring`
+
+This module provides the `OutboxThenSpringEventPublisherAdapter`, which bridges the engine's `EventPublisherPort` to both the durable outbox and the in-process Spring event bus.
+
+```java
+public void publish(Object event) {
+    // 1. Write the event to business_event_outbox (durable, within transaction)
+    outboxPort.append(event);
+    // 2. After commit, fire a Spring ApplicationEvent in the same JVM
+    transactionRunner.runAfterCommit(() -> springApplicationEventPublisher.publish(event));
+}
+```
+
+The two-step design means:
+
+- **The outbox write is transactional.** If the command transaction rolls back, no event is appended.
+- **The Spring `ApplicationEvent` fires post-commit.** In monolith mode, this wakes the in-process balance worker (`supra-worker-balance-calculation-events-spring`) immediately. In distributed mode the Spring event is still fired but the real workers poll the outbox via NATS.
+- **Workers in distributed mode see the event via the outbox**, not the Spring bus, so there is no risk of processing an event whose owning transaction was rolled back.
+
+---
+
+## When to modify this layer
+
+- **New persistence adapter**: implement the new outbound port interface from the engine, create the JPA entity class, and add Flyway migration scripts if the schema needs a new table or column.
+- **New DB column on an existing entity**: add the field to the JPA entity, write a Flyway migration, update the adapter's mapping logic, and update the corresponding domain aggregate and its `reconstitute` factory.
+- **Changing the DB schema**: always write a Flyway migration. Never use `spring.jpa.hibernate.ddl-auto=update` in production; PostgreSQL mode uses `validate`.
+- **New outbound port**: define the interface in the engine module, implement it here, and add it to the Spring configuration class in the relevant runtime module.
+- **Changing transaction boundaries**: modify the `TransactionalXxxUseCase` wrapper in the engine module, not the adapter.

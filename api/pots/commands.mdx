@@ -1,0 +1,617 @@
+---
+title: "Pot Command Endpoints: Create, Update, and Delete Pots"
+sidebarTitle: "Pot Commands"
+description: "REST endpoints for mutating pots and their shareholders: POST /api/pots, PATCH /api/pots/{potId}/details, DELETE /api/pots/{potId}, and shareholder management endpoints."
+---
+
+This page documents all mutation endpoints under `/api/pots`. These endpoints create, update, and delete pots, manage shareholders, and create expenses within a pot.
+
+## Headers
+
+All command endpoints require the following headers:
+
+| Header | Required | Description |
+|---|---|---|
+| `X-User-Id` | **Required** | UUID of the calling user. Must be a valid UUID. |
+| `X-User-Scopes` | **Required** | Semicolon-separated list of scopes authorizing the operation (e.g., `pot:create`). |
+| `Content-Type` | **Required** | Must be `application/json`. |
+
+<Note>
+  Although `X-User-Scopes` is marked `required = false` at the HTTP layer, the application will
+  reject requests that carry no scopes with a `400 MISSING_USER_SCOPES` error. Always supply
+  the scope(s) appropriate to the operation.
+</Note>
+
+---
+
+## `POST /api/pots` — Create a pot
+
+Creates a new expense pot. The calling user (identified by `X-User-Id`) is recorded as the pot's creator. Returns `201 Created` on success.
+
+**Required scope:** `pot:create`
+
+### Request body
+
+<ParamField body="label" type="string" required>
+  Human-readable name for the pot (e.g., `"Summer Road Trip"`).
+</ParamField>
+
+### Response body
+
+<ResponseField name="id" type="string">
+  UUID of the newly created pot.
+</ResponseField>
+<ResponseField name="label" type="string">
+  The label provided in the request.
+</ResponseField>
+<ResponseField name="creatorId" type="string">
+  UUID of the user who created the pot (taken from `X-User-Id`).
+</ResponseField>
+<ResponseField name="deleted" type="boolean">
+  `false` for a freshly created pot.
+</ResponseField>
+<ResponseField name="version" type="integer">
+  Monotonically-increasing event sequence number. Pass this value as `expectedVersion` in subsequent commands to ensure optimistic concurrency.
+</ResponseField>
+
+### Example
+
+```bash
+curl -X POST http://localhost:8080/api/pots \
+  -H "X-User-Id: 22222222-2222-2222-2222-222222222222" \
+  -H "X-User-Scopes: pot:create" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "label": "Summer Road Trip"
+  }'
+```
+
+```json
+{
+  "id": "550e8400-e29b-41d4-a716-446655440000",
+  "label": "Summer Road Trip",
+  "creatorId": "22222222-2222-2222-2222-222222222222",
+  "deleted": false,
+  "version": 1
+}
+```
+
+---
+
+## `PATCH /api/pots/{potId}/details` — Update pot details
+
+Updates the mutable fields of an existing pot. Currently only `label` can be changed. Returns `200 OK` on success.
+
+**Required scope:** `pot.details:update`
+
+### Path parameters
+
+<ParamField path="potId" type="string" required>
+  UUID of the pot to update.
+</ParamField>
+
+### Request body
+
+<ParamField body="label" type="string" required>
+  New label for the pot.
+</ParamField>
+<ParamField body="expectedVersion" type="integer" required>
+  The current `version` of the pot as returned by the most recent command or query response. The server rejects the command if the stored version does not match, preventing lost updates.
+</ParamField>
+
+<Note>
+  `expectedVersion` implements optimistic concurrency control. Always read the latest `version`
+  from the pot before issuing a command, and forward that value here. If another writer has
+  changed the pot in the meantime the server returns `409 Conflict`.
+</Note>
+
+### Response body
+
+<ResponseField name="id" type="string">UUID of the pot.</ResponseField>
+<ResponseField name="label" type="string">Updated label.</ResponseField>
+<ResponseField name="creatorId" type="string">UUID of the pot creator.</ResponseField>
+<ResponseField name="deleted" type="boolean">Whether the pot is deleted.</ResponseField>
+<ResponseField name="version" type="integer">New version number after this command.</ResponseField>
+
+### Example
+
+```bash
+curl -X PATCH http://localhost:8080/api/pots/550e8400-e29b-41d4-a716-446655440000/details \
+  -H "X-User-Id: 22222222-2222-2222-2222-222222222222" \
+  -H "X-User-Scopes: pot.details:update" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "label": "Summer Road Trip — Final",
+    "expectedVersion": 1
+  }'
+```
+
+```json
+{
+  "id": "550e8400-e29b-41d4-a716-446655440000",
+  "label": "Summer Road Trip — Final",
+  "creatorId": "22222222-2222-2222-2222-222222222222",
+  "deleted": false,
+  "version": 2
+}
+```
+
+---
+
+## `DELETE /api/pots/{potId}` — Delete a pot
+
+Soft-deletes a pot. The pot record is retained but marked as deleted (`"deleted": true`). Returns `200 OK` on success.
+
+**Required scope:** `pot:delete`
+
+### Path parameters
+
+<ParamField path="potId" type="string" required>
+  UUID of the pot to delete.
+</ParamField>
+
+### Request body
+
+<ParamField body="expectedVersion" type="integer" required>
+  Current version of the pot. The server rejects the command if the stored version does not match.
+</ParamField>
+
+### Response body
+
+<ResponseField name="id" type="string">UUID of the deleted pot.</ResponseField>
+<ResponseField name="label" type="string">Label of the pot at time of deletion.</ResponseField>
+<ResponseField name="creatorId" type="string">UUID of the pot creator.</ResponseField>
+<ResponseField name="deleted" type="boolean">`true` after a successful delete.</ResponseField>
+<ResponseField name="version" type="integer">New version number after this command.</ResponseField>
+
+### Example
+
+```bash
+curl -X DELETE http://localhost:8080/api/pots/550e8400-e29b-41d4-a716-446655440000 \
+  -H "X-User-Id: 22222222-2222-2222-2222-222222222222" \
+  -H "X-User-Scopes: pot:delete" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "expectedVersion": 2
+  }'
+```
+
+```json
+{
+  "id": "550e8400-e29b-41d4-a716-446655440000",
+  "label": "Summer Road Trip — Final",
+  "creatorId": "22222222-2222-2222-2222-222222222222",
+  "deleted": true,
+  "version": 3
+}
+```
+
+---
+
+## `POST /api/pots/{potId}/shareholders` — Add shareholders
+
+Adds one or more new shareholders to a pot. Each shareholder represents a participant and is assigned a fractional weight that controls their share of expenses. Returns `201 Created` on success.
+
+**Required scope:** `shareholder:create`
+
+### Path parameters
+
+<ParamField path="potId" type="string" required>
+  UUID of the pot to add shareholders to.
+</ParamField>
+
+### Request body
+
+<ParamField body="shareholders" type="array" required>
+  Non-empty list of shareholders to add.
+  <Expandable title="Shareholder object">
+    <ParamField body="name" type="string" required>
+      Display name of the shareholder (e.g., `"Alice"`).
+    </ParamField>
+    <ParamField body="weightNumerator" type="integer" required>
+      Numerator of the shareholder's fractional weight.
+    </ParamField>
+    <ParamField body="weightDenominator" type="integer" required>
+      Denominator of the shareholder's fractional weight. Together with `weightNumerator`, this expresses the fraction of each expense borne by this shareholder. For example, `weightNumerator: 1, weightDenominator: 2` means this shareholder bears half of each expense.
+    </ParamField>
+  </Expandable>
+</ParamField>
+<ParamField body="expectedVersion" type="integer" required>
+  Current version of the pot.
+</ParamField>
+
+<Tip>
+  Weights do not need to sum to 1. The engine normalises them relative to the full set of
+  shareholders. For example, giving two shareholders weights of `1/2` each is equivalent to
+  giving them weights of `1/1` each — both result in a 50/50 split.
+</Tip>
+
+### Response body
+
+<ResponseField name="potId" type="string">UUID of the pot.</ResponseField>
+<ResponseField name="shareholders" type="array">
+  Updated list of all shareholders on the pot.
+  <Expandable title="Shareholder object">
+    <ResponseField name="id" type="string">UUID assigned to this shareholder.</ResponseField>
+    <ResponseField name="potId" type="string">UUID of the owning pot.</ResponseField>
+    <ResponseField name="name" type="string">Display name.</ResponseField>
+    <ResponseField name="weight" type="object">
+      Fractional weight as `{ numerator, denominator }`.
+      <Expandable title="FractionResponse">
+        <ResponseField name="numerator" type="integer">Numerator of the weight fraction.</ResponseField>
+        <ResponseField name="denominator" type="integer">Denominator of the weight fraction.</ResponseField>
+      </Expandable>
+    </ResponseField>
+    <ResponseField name="userId" type="string">
+      UUID of the linked application user, or `null` if the shareholder has not yet been linked to a user account.
+    </ResponseField>
+    <ResponseField name="deleted" type="boolean">Whether this shareholder has been removed.</ResponseField>
+  </Expandable>
+</ResponseField>
+<ResponseField name="version" type="integer">New version number of the pot after this command.</ResponseField>
+
+### Example
+
+```bash
+curl -X POST http://localhost:8080/api/pots/550e8400-e29b-41d4-a716-446655440000/shareholders \
+  -H "X-User-Id: 22222222-2222-2222-2222-222222222222" \
+  -H "X-User-Scopes: shareholder:create" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "shareholders": [
+      { "name": "Alice", "weightNumerator": 1, "weightDenominator": 2 },
+      { "name": "Bob",   "weightNumerator": 1, "weightDenominator": 2 }
+    ],
+    "expectedVersion": 2
+  }'
+```
+
+```json
+{
+  "potId": "550e8400-e29b-41d4-a716-446655440000",
+  "shareholders": [
+    {
+      "id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      "potId": "550e8400-e29b-41d4-a716-446655440000",
+      "name": "Alice",
+      "weight": { "numerator": 1, "denominator": 2 },
+      "userId": null,
+      "deleted": false
+    },
+    {
+      "id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+      "potId": "550e8400-e29b-41d4-a716-446655440000",
+      "name": "Bob",
+      "weight": { "numerator": 1, "denominator": 2 },
+      "userId": null,
+      "deleted": false
+    }
+  ],
+  "version": 3
+}
+```
+
+---
+
+## `PATCH /api/pots/{potId}/shareholders/details` — Update shareholder details
+
+Updates the `name` and/or linked `userId` for one or more existing shareholders. This is the standard way to associate a shareholder record with an application user account. Returns `200 OK` on success.
+
+**Required scope:** `shareholder.details:update`
+
+### Path parameters
+
+<ParamField path="potId" type="string" required>
+  UUID of the pot whose shareholders are being updated.
+</ParamField>
+
+### Request body
+
+<ParamField body="shareholders" type="array" required>
+  Non-empty list of shareholder detail updates.
+  <Expandable title="Shareholder details object">
+    <ParamField body="shareholderId" type="string" required>
+      UUID of the shareholder to update.
+    </ParamField>
+    <ParamField body="name" type="string" required>
+      New display name for the shareholder.
+    </ParamField>
+    <ParamField body="userId" type="string">
+      UUID of the application user to link to this shareholder. Can be `null` to unlink.
+    </ParamField>
+  </Expandable>
+</ParamField>
+<ParamField body="expectedVersion" type="integer" required>
+  Current version of the pot.
+</ParamField>
+
+### Response body
+
+Same structure as [Add shareholders](#post-apipotspotidshareholders) — returns a `PotShareholdersResponse` with the updated shareholder list and new version.
+
+<ResponseField name="potId" type="string">UUID of the pot.</ResponseField>
+<ResponseField name="shareholders" type="array">
+  Updated list of all shareholders.
+  <Expandable title="Shareholder object">
+    <ResponseField name="id" type="string">Shareholder UUID.</ResponseField>
+    <ResponseField name="potId" type="string">Owning pot UUID.</ResponseField>
+    <ResponseField name="name" type="string">Display name.</ResponseField>
+    <ResponseField name="weight" type="object">
+      `{ numerator, denominator }` fractional weight.
+    </ResponseField>
+    <ResponseField name="userId" type="string">Linked user UUID (may be `null`).</ResponseField>
+    <ResponseField name="deleted" type="boolean">Whether the shareholder is deleted.</ResponseField>
+  </Expandable>
+</ResponseField>
+<ResponseField name="version" type="integer">New version number after this command.</ResponseField>
+
+### Example
+
+```bash
+curl -X PATCH http://localhost:8080/api/pots/550e8400-e29b-41d4-a716-446655440000/shareholders/details \
+  -H "X-User-Id: 22222222-2222-2222-2222-222222222222" \
+  -H "X-User-Scopes: shareholder.details:update" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "shareholders": [
+      {
+        "shareholderId": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        "name": "Alice",
+        "userId": "22222222-2222-2222-2222-222222222222"
+      },
+      {
+        "shareholderId": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        "name": "Bob",
+        "userId": "33333333-3333-3333-3333-333333333333"
+      }
+    ],
+    "expectedVersion": 3
+  }'
+```
+
+```json
+{
+  "potId": "550e8400-e29b-41d4-a716-446655440000",
+  "shareholders": [
+    {
+      "id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      "potId": "550e8400-e29b-41d4-a716-446655440000",
+      "name": "Alice",
+      "weight": { "numerator": 1, "denominator": 2 },
+      "userId": "22222222-2222-2222-2222-222222222222",
+      "deleted": false
+    },
+    {
+      "id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+      "potId": "550e8400-e29b-41d4-a716-446655440000",
+      "name": "Bob",
+      "weight": { "numerator": 1, "denominator": 2 },
+      "userId": "33333333-3333-3333-3333-333333333333",
+      "deleted": false
+    }
+  ],
+  "version": 4
+}
+```
+
+---
+
+## `PATCH /api/pots/{potId}/shareholders/weights` — Update shareholder weights
+
+Reassigns the fractional weight of one or more shareholders without changing their other details. Weights are expressed as fractions (`weightNumerator / weightDenominator`). Returns `200 OK` on success.
+
+**Required scope:** `shareholder.weight:update`
+
+### Path parameters
+
+<ParamField path="potId" type="string" required>
+  UUID of the pot.
+</ParamField>
+
+### Request body
+
+<ParamField body="shareholders" type="array" required>
+  Non-empty list of weight updates.
+  <Expandable title="Shareholder weight object">
+    <ParamField body="shareholderId" type="string" required>
+      UUID of the shareholder whose weight is being changed.
+    </ParamField>
+    <ParamField body="weightNumerator" type="integer" required>
+      New numerator of the weight fraction.
+    </ParamField>
+    <ParamField body="weightDenominator" type="integer" required>
+      New denominator of the weight fraction. For example, `weightNumerator: 2, weightDenominator: 3` means this shareholder bears ⅔ of each expense.
+    </ParamField>
+  </Expandable>
+</ParamField>
+<ParamField body="expectedVersion" type="integer" required>
+  Current version of the pot.
+</ParamField>
+
+<Tip>
+  Weights are stored and compared as fractions (numerator / denominator), not as decimals. A
+  weight of `2/3` means "two thirds". The weights of all shareholders in a pot are
+  normalised at calculation time, so they do not need to sum to any particular value — only
+  their relative ratios matter.
+</Tip>
+
+### Response body
+
+<ResponseField name="potId" type="string">UUID of the pot.</ResponseField>
+<ResponseField name="shareholders" type="array">
+  Full shareholder list with updated weights.
+  <Expandable title="Shareholder object">
+    <ResponseField name="id" type="string">Shareholder UUID.</ResponseField>
+    <ResponseField name="potId" type="string">Owning pot UUID.</ResponseField>
+    <ResponseField name="name" type="string">Display name.</ResponseField>
+    <ResponseField name="weight" type="object">
+      Updated fractional weight `{ numerator, denominator }`.
+    </ResponseField>
+    <ResponseField name="userId" type="string">Linked user UUID (may be `null`).</ResponseField>
+    <ResponseField name="deleted" type="boolean">Whether the shareholder is deleted.</ResponseField>
+  </Expandable>
+</ResponseField>
+<ResponseField name="version" type="integer">New version number after this command.</ResponseField>
+
+### Example
+
+```bash
+curl -X PATCH http://localhost:8080/api/pots/550e8400-e29b-41d4-a716-446655440000/shareholders/weights \
+  -H "X-User-Id: 22222222-2222-2222-2222-222222222222" \
+  -H "X-User-Scopes: shareholder.weight:update" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "shareholders": [
+      {
+        "shareholderId": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        "weightNumerator": 2,
+        "weightDenominator": 3
+      },
+      {
+        "shareholderId": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        "weightNumerator": 1,
+        "weightDenominator": 3
+      }
+    ],
+    "expectedVersion": 4
+  }'
+```
+
+```json
+{
+  "potId": "550e8400-e29b-41d4-a716-446655440000",
+  "shareholders": [
+    {
+      "id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      "potId": "550e8400-e29b-41d4-a716-446655440000",
+      "name": "Alice",
+      "weight": { "numerator": 2, "denominator": 3 },
+      "userId": "22222222-2222-2222-2222-222222222222",
+      "deleted": false
+    },
+    {
+      "id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+      "potId": "550e8400-e29b-41d4-a716-446655440000",
+      "name": "Bob",
+      "weight": { "numerator": 1, "denominator": 3 },
+      "userId": "33333333-3333-3333-3333-333333333333",
+      "deleted": false
+    }
+  ],
+  "version": 5
+}
+```
+
+---
+
+## `POST /api/pots/{potId}/expenses` — Create an expense
+
+Records a new expense against the pot and distributes it among shareholders according to the specified per-share weights. Returns `201 Created` on success.
+
+**Required scope:** `expense:create`
+
+### Path parameters
+
+<ParamField path="potId" type="string" required>
+  UUID of the pot the expense belongs to.
+</ParamField>
+
+### Request body
+
+<ParamField body="payerId" type="string" required>
+  UUID of the **shareholder** (not user) who paid the expense.
+</ParamField>
+<ParamField body="amountNumerator" type="integer" required>
+  Numerator of the expense amount as a fraction. For a whole number amount (e.g., €42), use `amountNumerator: 42` and `amountDenominator: 1`.
+</ParamField>
+<ParamField body="amountDenominator" type="integer" required>
+  Denominator of the expense amount fraction. Must be positive.
+</ParamField>
+<ParamField body="label" type="string" required>
+  Human-readable description of the expense (e.g., `"Dinner"`).
+</ParamField>
+<ParamField body="shares" type="array" required>
+  Non-empty list of per-shareholder share weights. Each entry controls how much of this
+  specific expense is attributed to a particular shareholder.
+  <Expandable title="Share object">
+    <ParamField body="shareholderId" type="string" required>
+      UUID of the shareholder receiving this share.
+    </ParamField>
+    <ParamField body="weightNumerator" type="integer" required>
+      Numerator of this shareholder's weight for this expense.
+    </ParamField>
+    <ParamField body="weightDenominator" type="integer" required>
+      Denominator of this shareholder's weight for this expense.
+    </ParamField>
+  </Expandable>
+</ParamField>
+<ParamField body="expectedVersion" type="integer" required>
+  Current version of the pot. Creating an expense advances the pot's version.
+</ParamField>
+
+<Note>
+  The `shares` list controls the **expense-level** split and is independent of the
+  shareholder-level weights defined on the pot. This allows individual expenses to be
+  split unevenly (e.g., only some shareholders share a particular expense).
+</Note>
+
+### Response body
+
+<ResponseField name="expenseId" type="string">UUID of the newly created expense.</ResponseField>
+<ResponseField name="potId" type="string">UUID of the owning pot.</ResponseField>
+<ResponseField name="shares" type="array">
+  List of per-shareholder share allocations.
+  <Expandable title="ExpenseShareResponse">
+    <ResponseField name="shareholderId" type="string">UUID of the shareholder.</ResponseField>
+    <ResponseField name="weight" type="object">
+      Fractional weight for this share `{ numerator, denominator }`.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+<ResponseField name="version" type="integer">New version number of the pot (and the expense) after this command.</ResponseField>
+
+### Example
+
+```bash
+curl -X POST http://localhost:8080/api/pots/550e8400-e29b-41d4-a716-446655440000/expenses \
+  -H "X-User-Id: 22222222-2222-2222-2222-222222222222" \
+  -H "X-User-Scopes: expense:create" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "payerId": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+    "amountNumerator": 42,
+    "amountDenominator": 1,
+    "label": "Lunch",
+    "shares": [
+      {
+        "shareholderId": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        "weightNumerator": 1,
+        "weightDenominator": 2
+      },
+      {
+        "shareholderId": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        "weightNumerator": 1,
+        "weightDenominator": 2
+      }
+    ],
+    "expectedVersion": 5
+  }'
+```
+
+```json
+{
+  "expenseId": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+  "potId": "550e8400-e29b-41d4-a716-446655440000",
+  "shares": [
+    {
+      "shareholderId": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      "weight": { "numerator": 1, "denominator": 2 }
+    },
+    {
+      "shareholderId": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+      "weight": { "numerator": 1, "denominator": 2 }
+    }
+  ],
+  "version": 6
+}
+```

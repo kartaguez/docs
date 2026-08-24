@@ -1,0 +1,118 @@
+---
+title: "Balance Projection Pipeline: How Pocoma Computes Balances"
+sidebarTitle: "Overview"
+description: "Pocoma computes pot balances asynchronously through a durable two-stage pipeline: a task builder coalesces business events, and a task executor runs the balance calculator."
+---
+
+## Why Asynchronous?
+
+When a command is submitted — creating an expense, updating a participant, deleting a pot — Pocoma persists the business state and writes a business event into `business_event_outbox` **within the same transaction**. The HTTP response is returned as soon as that transaction commits. Balance computation happens afterward, in background workers.
+
+This design has three concrete consequences:
+
+- **Commands stay fast.** Request threads never block on balance calculation. A burst of commands produces a backlog of database rows, not blocked HTTP handlers.
+- **Back pressure is explicit and measurable.** The depth of `business_event_outbox` and `projection_tasks` is directly observable in Prometheus (`pocoma_projection_outbox_pending`, `pocoma_projection_tasks_pending`). Lag is not hidden; it is tracked.
+- **Projection failures are isolated.** A calculation error cannot roll back a successfully committed command. Workers retry independently.
+
+<Note>
+  Queries that read balances may return a version slightly behind the latest
+  command. The projection pipeline is designed to drain quickly under normal
+  load. Use the Prometheus metrics or the Grafana dashboard to verify drain
+  behavior in your deployment.
+</Note>
+
+## Pipeline Flow
+
+Every balance update travels through the same two-stage pipeline:
+
+```text
+HTTP command
+  → command transaction (persists business state)
+  → business_event_outbox row (PENDING)
+  → task builder worker (woken by NATS / Spring event / polling timeout)
+      → claims batch of outbox rows
+      → BuildProjectionTasksUseCase
+      → creates or coalesces projection_tasks row (PENDING)
+      → publishes PROJECTION_TASKS_AVAILABLE wake signal
+  → task executor worker (woken by NATS / Spring event / polling timeout)
+      → capacity check against SegmentedWorkerPool
+      → claims batch of projection_tasks rows
+      → SegmentedProjectionTaskExecutor.trySubmit
+      → ExecuteProjectionTasksUseCase
+          → PotBalancesCalculator (pure math)
+      → persists results to pot_balance_* tables
+```
+
+The database is the sole source of truth for pending work. In-process queues inside each worker are intentionally short-lived buffers. If a worker process crashes, all in-flight rows return to `PENDING` when their leases expire, and another worker picks them up.
+
+## Three-Layer Code Architecture
+
+The implementation separates concerns into three distinct layers so that each can be tested and extended independently.
+
+<CardGroup cols={3}>
+  <Card title="Supra Worker" icon="gears">
+    **`orchestrator-claimable-work-dispatcher`**
+
+    Owns everything operational: wake waiting, polling, capacity checks, claim
+    admission, bounded segmented queues, worker threads, lease fencing, and
+    status transitions (`CLAIMED` → `ACCEPTED` → `RUNNING` → `DONE` /
+    `FAILED`). Business logic never touches these concerns.
+  </Card>
+  <Card title="Engine Use Case" icon="code">
+    **`BuildProjectionTasksUseCase`** and **`ExecuteProjectionTasksUseCase`**
+
+    Receive an already-admitted, already-claimed unit of work and perform the
+    application-level logic. They do not claim rows, release rows, manage
+    queues, or transition statuses.
+  </Card>
+  <Card title="Domain Calculator" icon="calculator">
+    **`domain-projection` → `PotBalancesCalculator`**
+
+    Pure, deterministic balance calculation. No Spring, no JPA, no task
+    statuses, no event publication. The output of a given `(potId,
+    targetVersion)` is always the same regardless of how it is invoked.
+  </Card>
+</CardGroup>
+
+## At-Least-Once Execution and Idempotence
+
+The pipeline is **at-least-once**: a worker may execute the same task more than once after a lease expiry or a process restart. Duplicate execution is safe because `ComputePotBalancesUseCase` is **idempotent** for a given `(potId, targetVersion)` pair and persists results using optimistic projection-state progression.
+
+If a projection for `(potId, targetVersion)` already exists, re-running the task produces the same output and the write is a no-op. This means you can freely add worker processes, increase batch sizes, or shorten lease durations without risking data corruption.
+
+## Table Coalescing
+
+There is at most **one active `COMPUTE_BALANCES_FOR_VERSION` task per pot** at any time. When multiple business events arrive for the same pot before the task executor claims the existing task, the task builder raises `target_version` to the highest event version instead of inserting additional rows. The executor then computes balances up to that higher version in a single pass.
+
+This coalescing behaviour means:
+
+- A pot that receives 100 rapid expense updates will typically produce one or two projection tasks, not 100.
+- Hot pots do not create unbounded queue depth in `projection_tasks`.
+- The `target_version` in a claimed task always reflects the latest known state at the time of the claim.
+
+<Warning>
+  Coalescing assumes that `PotBalancesCalculator` computes the full balance
+  state up to `targetVersion` in one call. If you introduce a new projection
+  type that cannot do this, you must introduce a separate task type with its
+  own coalescing rules rather than reusing `COMPUTE_BALANCES_FOR_VERSION`.
+</Warning>
+
+## Further Reading
+
+<CardGroup cols={2}>
+  <Card title="Task Builder" href="/projection/task-builder" icon="hammer">
+    How the task builder claims outbox rows, coalesces tasks, and emits wake
+    signals.
+  </Card>
+  <Card title="Task Executor" href="/projection/task-executor" icon="play">
+    How the task executor claims tasks, routes them to the segmented pool, and
+    persists balance results.
+  </Card>
+  <Card title="Wake Signals" href="/projection/wake-signals" icon="bolt">
+    The best-effort signal layer that keeps workers responsive between polling
+    timeouts.
+  </Card>
+  <Card title="Configuration" href="/projection/configuration" icon="sliders">
+    All Spring Boot properties for the projection worker, grouped by prefix.
+  </Card>
+</CardGroup>

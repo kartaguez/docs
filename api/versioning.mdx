@@ -1,0 +1,171 @@
+---
+title: "Optimistic Concurrency and Versioned Reads in Pocoma"
+sidebarTitle: "Versioning"
+description: "Every Pocoma pot has a monotonically increasing version. Commands require an expectedVersion to prevent concurrent conflicts; queries can target any past version."
+---
+
+## Overview
+
+Every pot in Pocoma carries a **global version number** — a monotonically increasing integer that starts at `1` when the pot is created and increments by one on every successful command. This version drives two separate mechanisms:
+
+- **Write side** — optimistic concurrency: commands must declare what version they expect to find, preventing lost-update races.
+- **Read side** — versioned queries: any query endpoint can pin its read to a specific historical version.
+
+---
+
+## Write Side: Optimistic Concurrency
+
+Every mutating command (create expense, update pot details, add shareholders, delete pot, etc.) must include an `expectedVersion` field in its request body. Pocoma compares this value against the pot's current stored version before executing the command:
+
+- If they **match**, the command proceeds and the pot's version is incremented by one.
+- If they **differ**, the command is rejected with `409 Conflict` and error code `POT_VERSION_CONFLICT`. No state is changed.
+
+<Warning>
+Never hardcode `expectedVersion`. Always read the current version from the pot's latest response and use that value in your next command. If another process has modified the pot between your read and your write, you will receive a `409` and must re-read before retrying.
+</Warning>
+
+### Example: Successful Command
+
+Fetch the current pot to learn its version:
+
+```bash
+curl http://localhost:8080/api/pots/7a3f9e1b-0c44-4d2e-b8fa-9f1234567890 \
+  -H "X-User-Id: 22222222-2222-2222-2222-222222222222" \
+  -H "X-User-Scopes: pot:read"
+```
+
+```json
+{
+  "id": "7a3f9e1b-0c44-4d2e-b8fa-9f1234567890",
+  "label": "Trip to Barcelona",
+  "creatorId": "22222222-2222-2222-2222-222222222222",
+  "deleted": false,
+  "version": 3
+}
+```
+
+Send the command with `expectedVersion: 3`:
+
+```bash
+curl -X PATCH http://localhost:8080/api/pots/7a3f9e1b-0c44-4d2e-b8fa-9f1234567890/details \
+  -H "X-User-Id: 22222222-2222-2222-2222-222222222222" \
+  -H "X-User-Scopes: pot.details:update" \
+  -H "Content-Type: application/json" \
+  -d '{"label": "Trip to Rome", "expectedVersion": 3}'
+```
+
+```json
+{
+  "id": "7a3f9e1b-0c44-4d2e-b8fa-9f1234567890",
+  "label": "Trip to Rome",
+  "creatorId": "22222222-2222-2222-2222-222222222222",
+  "deleted": false,
+  "version": 4
+}
+```
+
+The response always reflects the **new version** after the successful command (`4` here).
+
+### Example: Rejected Command (Version Conflict)
+
+If you supply a stale version (e.g. another process has already run a command on this pot):
+
+```bash
+curl -X PATCH http://localhost:8080/api/pots/7a3f9e1b-0c44-4d2e-b8fa-9f1234567890/details \
+  -H "X-User-Id: 22222222-2222-2222-2222-222222222222" \
+  -H "X-User-Scopes: pot.details:update" \
+  -H "Content-Type: application/json" \
+  -d '{"label": "Trip to Rome", "expectedVersion": 2}'
+```
+
+```json
+{
+  "code": "POT_VERSION_CONFLICT",
+  "message": "Version conflict on pot 7a3f9e1b-0c44-4d2e-b8fa-9f1234567890",
+  "status": 409,
+  "path": "/api/pots/7a3f9e1b-0c44-4d2e-b8fa-9f1234567890/details"
+}
+```
+
+### Optimistic Concurrency Retry Pattern
+
+```java
+// 1. Fetch the current pot state
+PotResponse pot = getPot(potId);
+long currentVersion = pot.version();
+
+// 2. Attempt the command with the observed version
+try {
+    updatePotDetails(potId, newLabel, currentVersion);
+} catch (VersionConflictException e) {
+    // 3. Re-fetch and retry — another process modified the pot concurrently
+    pot = getPot(potId);
+    currentVersion = pot.version();
+    updatePotDetails(potId, newLabel, currentVersion);
+}
+```
+
+<Tip>
+In high-concurrency scenarios, wrap the fetch-and-command sequence in a retry loop with a small backoff. Each `409` tells you a concurrent writer won the round; re-reading is always safe because reads are non-destructive.
+</Tip>
+
+---
+
+## Read Side: Versioned Queries
+
+All query endpoints accept an optional `?version=N` query parameter. When provided, Pocoma returns the pot's state as of that version rather than the latest. When omitted, the current (latest) version is returned.
+
+### Versioned Query Example
+
+Get a pot at version 2:
+
+```bash
+curl "http://localhost:8080/api/pots/7a3f9e1b-0c44-4d2e-b8fa-9f1234567890?version=2" \
+  -H "X-User-Id: 22222222-2222-2222-2222-222222222222" \
+  -H "X-User-Scopes: pot:read"
+```
+
+Get balances at version 2:
+
+```bash
+curl "http://localhost:8080/api/pots/7a3f9e1b-0c44-4d2e-b8fa-9f1234567890/balances?version=2" \
+  -H "X-User-Id: 22222222-2222-2222-2222-222222222222" \
+  -H "X-User-Scopes: pot:read"
+```
+
+### Endpoints That Accept `?version=N`
+
+| Method | Path | Accepts `?version=N` |
+|---|---|---|
+| `GET` | `/api/pots/{potId}` | ✅ |
+| `GET` | `/api/pots/{potId}/expenses` | ✅ |
+| `GET` | `/api/pots/{potId}/balances` | ✅ |
+| `GET` | `/api/pots/balances/me` | ✅ |
+| `GET` | `/api/pots` | ❌ (always returns current) |
+
+<Note>
+The `version` parameter is a `long`. Supplying a version that does not exist (e.g. a version greater than the pot's current version, or `0`) results in a `404 Not Found`.
+</Note>
+
+---
+
+## The `deleted` Flag
+
+Soft-deleting a pot increments its version and sets an internal deleted marker. This affects query behaviour differently depending on whether you are accessing the pot directly or via a list:
+
+- **Direct views** (e.g. `GET /api/pots/{potId}`) — return the pot with `"deleted": true`. The entity is visible; you can still read its historical state.
+- **List endpoints** (e.g. `GET /api/pots`) — hide deleted pots entirely. A deleted pot does not appear in list results.
+
+```json
+{
+  "id": "7a3f9e1b-0c44-4d2e-b8fa-9f1234567890",
+  "label": "Trip to Barcelona",
+  "creatorId": "22222222-2222-2222-2222-222222222222",
+  "deleted": true,
+  "version": 5
+}
+```
+
+<Note>
+Commands cannot be sent to a deleted pot. Attempting to do so returns a business rule violation (`403 Forbidden`).
+</Note>

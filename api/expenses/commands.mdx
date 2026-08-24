@@ -1,0 +1,263 @@
+---
+title: "Expense Command Endpoints: Update and Delete Expenses"
+sidebarTitle: "Expense Commands"
+description: "REST endpoints for mutating expenses: PATCH /api/expenses/{expenseId}/details, PATCH /api/expenses/{expenseId}/shares, DELETE /api/expenses/{expenseId}."
+---
+
+This page documents the expense-scoped mutation endpoints under `/api/expenses`.
+
+<Note>
+  **Creating an expense** is done via `POST /api/pots/{potId}/expenses`, which is documented in
+  [Pot Commands](/api/pots/commands#post-apipotspotsidexpenses--create-an-expense). The endpoints
+  on this page cover updates and deletion of an existing expense identified by its own `expenseId`.
+</Note>
+
+## Headers
+
+| Header | Required | Description |
+|---|---|---|
+| `X-User-Id` | **Required** | UUID of the calling user. Must be a valid UUID. |
+| `X-User-Scopes` | **Required** | Semicolon-separated list of scopes. See each endpoint for the required scope. |
+| `Content-Type` | **Required** | Must be `application/json`. |
+
+---
+
+## `PATCH /api/expenses/{expenseId}/details` — Update expense details
+
+Updates the payer, amount, and/or label of an existing expense without changing its share breakdown. Returns `200 OK` on success.
+
+**Required scope:** `expense.details:update`
+
+### Path parameters
+
+<ParamField path="expenseId" type="string" required>
+  UUID of the expense to update.
+</ParamField>
+
+### Request body
+
+<ParamField body="payerId" type="string" required>
+  UUID of the **shareholder** who paid the expense. Must be an existing shareholder in the expense's pot.
+</ParamField>
+<ParamField body="amountNumerator" type="integer" required>
+  Numerator of the updated expense amount. For example, for an amount of €84 use `84`.
+</ParamField>
+<ParamField body="amountDenominator" type="integer" required>
+  Denominator of the updated expense amount. For a whole number use `1`.
+</ParamField>
+<ParamField body="label" type="string" required>
+  Updated human-readable description of the expense.
+</ParamField>
+<ParamField body="expectedVersion" type="integer" required>
+  The current version of the pot (not the expense itself). All expense commands advance the shared pot version, so always supply the latest version from the pot or expense response. The server rejects the command with `409 Conflict` if the version does not match.
+</ParamField>
+
+<Note>
+  `expectedVersion` refers to the **pot's** event version, which is shared across all expenses
+  within the same pot. After any command the response returns an updated `version`; pass that
+  value as `expectedVersion` in your next command.
+</Note>
+
+### Response body
+
+Returns an `ExpenseHeaderResponse` — the expense summary without the share breakdown.
+
+<ResponseField name="id" type="string">UUID of the expense.</ResponseField>
+<ResponseField name="potId" type="string">UUID of the owning pot.</ResponseField>
+<ResponseField name="payerId" type="string">UUID of the updated payer shareholder.</ResponseField>
+<ResponseField name="amount" type="object">
+  Updated expense amount as a fraction.
+  <Expandable title="FractionResponse">
+    <ResponseField name="numerator" type="integer">Numerator of the amount.</ResponseField>
+    <ResponseField name="denominator" type="integer">Denominator of the amount.</ResponseField>
+  </Expandable>
+</ResponseField>
+<ResponseField name="label" type="string">Updated label.</ResponseField>
+<ResponseField name="deleted" type="boolean">`false` for an active expense.</ResponseField>
+<ResponseField name="version" type="integer">New version number after this command. Use this as `expectedVersion` in the next command.</ResponseField>
+
+### Example
+
+```bash
+curl -X PATCH http://localhost:8080/api/expenses/cccccccc-cccc-cccc-cccc-cccccccccccc/details \
+  -H "X-User-Id: 22222222-2222-2222-2222-222222222222" \
+  -H "X-User-Scopes: expense.details:update" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "payerId": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+    "amountNumerator": 84,
+    "amountDenominator": 1,
+    "label": "Lunch (updated)",
+    "expectedVersion": 6
+  }'
+```
+
+```json
+{
+  "id": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+  "potId": "550e8400-e29b-41d4-a716-446655440000",
+  "payerId": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+  "amount": { "numerator": 84, "denominator": 1 },
+  "label": "Lunch (updated)",
+  "deleted": false,
+  "version": 7
+}
+```
+
+---
+
+## `PATCH /api/expenses/{expenseId}/shares` — Update expense shares
+
+Replaces the share breakdown of an existing expense. The new list of shares replaces the previous one entirely — all shareholders who should have a share in this expense must be included. Returns `200 OK` on success.
+
+**Required scope:** `expense.shares:update`
+
+### Path parameters
+
+<ParamField path="expenseId" type="string" required>
+  UUID of the expense whose shares are being updated.
+</ParamField>
+
+### Request body
+
+<ParamField body="shares" type="array" required>
+  Non-empty list of per-shareholder share weights. Replaces the current shares completely.
+  <Expandable title="Share object (ExpenseShareRequest)">
+    <ParamField body="shareholderId" type="string" required>
+      UUID of the shareholder receiving this share of the expense.
+    </ParamField>
+    <ParamField body="weightNumerator" type="integer" required>
+      Numerator of this shareholder's fractional weight for this expense.
+    </ParamField>
+    <ParamField body="weightDenominator" type="integer" required>
+      Denominator of this shareholder's fractional weight. For example,
+      `weightNumerator: 2, weightDenominator: 3` means this shareholder is responsible
+      for ⅔ of the expense.
+    </ParamField>
+  </Expandable>
+</ParamField>
+<ParamField body="expectedVersion" type="integer" required>
+  Current version of the pot. The server rejects the command if the version does not match.
+</ParamField>
+
+<Warning>
+  The `shares` list is a **full replacement**, not a patch. Any shareholder not included in the
+  new list will have no share in this expense after the command is applied.
+</Warning>
+
+### Response body
+
+Returns an `ExpenseSharesResponse` — the updated share breakdown for the expense.
+
+<ResponseField name="expenseId" type="string">UUID of the expense.</ResponseField>
+<ResponseField name="potId" type="string">UUID of the owning pot.</ResponseField>
+<ResponseField name="shares" type="array">
+  Updated list of per-shareholder share allocations.
+  <Expandable title="ExpenseShareResponse">
+    <ResponseField name="shareholderId" type="string">UUID of the shareholder.</ResponseField>
+    <ResponseField name="weight" type="object">
+      Fractional weight for this share `{ numerator, denominator }`.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+<ResponseField name="version" type="integer">New version number after this command.</ResponseField>
+
+### Example
+
+```bash
+curl -X PATCH http://localhost:8080/api/expenses/cccccccc-cccc-cccc-cccc-cccccccccccc/shares \
+  -H "X-User-Id: 22222222-2222-2222-2222-222222222222" \
+  -H "X-User-Scopes: expense.shares:update" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "shares": [
+      {
+        "shareholderId": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        "weightNumerator": 2,
+        "weightDenominator": 3
+      },
+      {
+        "shareholderId": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        "weightNumerator": 1,
+        "weightDenominator": 3
+      }
+    ],
+    "expectedVersion": 7
+  }'
+```
+
+```json
+{
+  "expenseId": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+  "potId": "550e8400-e29b-41d4-a716-446655440000",
+  "shares": [
+    {
+      "shareholderId": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      "weight": { "numerator": 2, "denominator": 3 }
+    },
+    {
+      "shareholderId": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+      "weight": { "numerator": 1, "denominator": 3 }
+    }
+  ],
+  "version": 8
+}
+```
+
+---
+
+## `DELETE /api/expenses/{expenseId}` — Delete an expense
+
+Soft-deletes an expense. The expense record is retained but marked as `deleted: true` and excluded from balance calculations. Returns `200 OK` on success.
+
+**Required scope:** `expense:delete`
+
+### Path parameters
+
+<ParamField path="expenseId" type="string" required>
+  UUID of the expense to delete.
+</ParamField>
+
+### Request body
+
+<ParamField body="expectedVersion" type="integer" required>
+  Current version of the pot. The server rejects the command if the version does not match.
+</ParamField>
+
+### Response body
+
+Returns an `ExpenseHeaderResponse` reflecting the deleted state.
+
+<ResponseField name="id" type="string">UUID of the deleted expense.</ResponseField>
+<ResponseField name="potId" type="string">UUID of the owning pot.</ResponseField>
+<ResponseField name="payerId" type="string">UUID of the payer shareholder at time of deletion.</ResponseField>
+<ResponseField name="amount" type="object">
+  Amount at time of deletion `{ numerator, denominator }`.
+</ResponseField>
+<ResponseField name="label" type="string">Label at time of deletion.</ResponseField>
+<ResponseField name="deleted" type="boolean">`true` after a successful delete.</ResponseField>
+<ResponseField name="version" type="integer">New version number after this command.</ResponseField>
+
+### Example
+
+```bash
+curl -X DELETE http://localhost:8080/api/expenses/cccccccc-cccc-cccc-cccc-cccccccccccc \
+  -H "X-User-Id: 22222222-2222-2222-2222-222222222222" \
+  -H "X-User-Scopes: expense:delete" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "expectedVersion": 8
+  }'
+```
+
+```json
+{
+  "id": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+  "potId": "550e8400-e29b-41d4-a716-446655440000",
+  "payerId": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+  "amount": { "numerator": 84, "denominator": 1 },
+  "label": "Lunch (updated)",
+  "deleted": true,
+  "version": 9
+}
+```

@@ -1,0 +1,142 @@
+---
+title: "Projection Wake Signals: Low-Latency Worker Notification"
+sidebarTitle: "Wake Signals"
+description: "Wake signals are best-effort hints that tell workers to poll the database sooner. They carry only a signal type and potId — the database remains the only source of truth."
+---
+
+## What Wake Signals Are
+
+Wake signals are **hints, not work items**. They tell a sleeping worker that something may have changed and that it should poll the database sooner than its scheduled timeout. A signal never carries event payloads, task IDs, or version numbers. The database always has the authoritative list of pending work.
+
+Concretely: if every NATS message were dropped, or if Spring events were never published, the projection pipeline would still make progress — just at the pace of the polling timeout intervals (`task-builder-polling-interval`, `task-executor-polling-interval`). Wake signals exist purely to reduce that latency from hundreds of milliseconds to near-zero under normal conditions.
+
+<Warning>
+  Never treat the absence of a wake signal as proof that no work exists.
+  Always rely on the database query to determine whether there are pending
+  rows. Wake signals only reduce the time a worker spends waiting.
+</Warning>
+
+## Signal Types
+
+There are three signal types, each with a specific producer and consumer:
+
+<CardGroup cols={3}>
+  <Card title="BUSINESS_EVENTS_AVAILABLE" icon="inbox">
+    **Producer:** command side — published after a business event row is
+    written to `business_event_outbox` and the transaction commits.
+
+    **Consumer:** task builder worker.
+
+    **Meaning:** new outbox rows may exist for `potId`.
+  </Card>
+  <Card title="PROJECTION_TASKS_AVAILABLE" icon="list-check">
+    **Producer:** task builder — published after at least one
+    `COMPUTE_BALANCES_FOR_VERSION` task is created or coalesced.
+
+    **Consumer:** task executor worker.
+
+    **Meaning:** new or updated projection tasks may exist for `potId`.
+  </Card>
+  <Card title="CAPACITY_AVAILABLE" icon="gauge-high">
+    **Producer:** `SegmentedProjectionTaskExecutor` — emitted when a
+    per-segment queue drains and frees space.
+
+    **Consumer:** task executor worker (in-process only).
+
+    **Meaning:** the local executor can accept more tasks for `potId`.
+  </Card>
+</CardGroup>
+
+## NATS Subjects (Distributed Mode)
+
+In split-runtime deployments, two of the three signals cross process boundaries over Core NATS. `CAPACITY_AVAILABLE` is always in-process.
+
+| Direction | Subject | Signal carried |
+|---|---|---|
+| Command runtime → task builder | `pocoma.projection.business-events.available` | `BUSINESS_EVENTS_AVAILABLE` |
+| Task builder → task executor | `pocoma.projection.tasks.available` | `PROJECTION_TASKS_AVAILABLE` |
+| Task executor → downstream | `pocoma.projection.tasks.processed` | Task `DONE` or `FAILED` notification |
+
+All three subjects are configurable via `pocoma.projection.nats.*` properties — see [Configuration](/projection/configuration).
+
+## NATS Payload Format
+
+The payload is intentionally minimal. No event data, no task IDs, no versions:
+
+```json
+{
+  "signal": "BUSINESS_EVENTS_AVAILABLE",
+  "potId": "pot-123",
+  "occurredAt": "2026-05-02T22:00:00Z"
+}
+```
+
+The same envelope shape is used for all signal types; only the `"signal"` field value changes. A worker that receives a payload it cannot parse (unknown signal type, missing fields) discards it silently — it will rely on the next polling timeout instead.
+
+## WorkWakeBus
+
+`WorkWakeBus` is the in-process wake contract that both dispatchers use. It is the single interface through which signals are both emitted and consumed inside a JVM.
+
+- **Subscription includes a `ProjectionPartition`.** A subscriber registered for `segment-index=1, segment-count=2` only receives signals for pots where `pot_partition_hash % 2 = 1`. This filtering is done locally in `PotPartitioner.belongsTo(potId, partition)` — NATS never carries segment information.
+- **Local (monolith) implementation** uses Spring `ApplicationEvent`. Signal routing is in-memory.
+- **NATS implementation** subscribes to the configured subject, deserializes the payload, checks partition membership, and fires the local `WorkWakeBus` event. NATS is a transport; partition filtering stays in the worker process.
+
+```text
+NATS message arrives
+  → NatsProjectionTasksWakeSubscriber deserializes payload
+  → PotPartitioner.belongsTo(potId, partition)?
+      yes → WorkWakeBus.emit(PROJECTION_TASKS_AVAILABLE, potId)
+      no  → discard
+```
+
+## Monolith vs. Split Mode
+
+<Tabs>
+  <Tab title="Monolith (Spring events)">
+    Both the task builder and task executor run in the same JVM as the API.
+
+    - `event-listener-enabled=true` enables the Spring `ApplicationEvent`
+      listener that converts post-commit business events into
+      `BUSINESS_EVENTS_AVAILABLE` signals.
+    - `pocoma.projection.nats.enabled=false` (NATS is unused).
+    - All signals travel in-process through `WorkWakeBus` without leaving the
+      JVM.
+
+    Suitable for local development and single-process deployments.
+  </Tab>
+  <Tab title="Split mode (NATS)">
+    `runtime-web-api`, `runtime-business-events-outbox-dispatcher`, and
+    `runtime-balance-calculation-tasks-dispatcher` run as separate processes.
+
+    - `pocoma.projection.nats.enabled=true` in each worker runtime.
+    - `event-listener-enabled=false` (default) in the API runtime; NATS carries
+      the signal from the API side to the task builder.
+    - The task builder's NATS adapter subscribes to
+      `pocoma.projection.business-events.available` and publishes to
+      `pocoma.projection.tasks.available`.
+    - The task executor's NATS adapter subscribes to
+      `pocoma.projection.tasks.available` and publishes to
+      `pocoma.projection.tasks.processed`.
+
+    Suitable for production and load testing.
+  </Tab>
+</Tabs>
+
+<Note>
+  Partition filtering is **always local**. NATS subjects are broadcast — every
+  subscriber receives every message on that subject. Each worker process
+  applies `PotPartitioner.belongsTo` to decide whether to act. This keeps
+  NATS configuration simple: you never need per-segment subjects or consumer
+  groups.
+</Note>
+
+## When to Add a New Signal
+
+If you introduce a new worker type that needs to be woken efficiently:
+
+1. Add a constant to `ProjectionWakeSignals` (in `shared-supra-dispatcher-projection`).
+2. Implement a producer that calls `WorkWakeBus.emit(newSignal, potId)` at the appropriate point.
+3. Register a `WorkWakeBus` subscription in your new worker with the correct `ProjectionPartition`.
+4. If the signal must cross process boundaries, add a new NATS subject to `pocoma.projection.nats.*` and implement a subscriber/publisher pair following the pattern in `NatsProjectionTasksWakeSubscriber` and `JnatsProjectionTaskExecutorWakeClient`.
+
+Do **not** put work-item data (event payloads, versions, task IDs) into signals. Keep the payload minimal and let the worker query the database for the actual work.

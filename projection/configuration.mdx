@@ -1,0 +1,135 @@
+---
+title: "Projection Worker Configuration Reference"
+sidebarTitle: "Configuration"
+description: "All Spring Boot properties for Pocoma's projection workers, grouped by prefix: pocoma.projection.worker and pocoma.projection.nats."
+---
+
+## Overview
+
+All projection worker properties share the `pocoma.projection.worker` prefix. NATS transport properties use the `pocoma.projection.nats` prefix. Both prefixes are bound at startup via Spring Boot `@ConfigurationProperties` and can be set through `application.properties`, environment variables, or command-line arguments.
+
+The task builder runtime (`runtime-business-events-outbox-dispatcher`) and the task executor runtime (`runtime-balance-calculation-tasks-dispatcher`) both read the same `pocoma.projection.worker` prefix, but each reads only the properties relevant to its role. Properties that start with `task-builder-*` are read by the task builder; those starting with `task-executor-*` are read by the executor.
+
+## Worker Properties (`pocoma.projection.worker`)
+
+| Property | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | `boolean` | `true` | Master switch. When `false`, neither the task builder nor the task executor starts. |
+| `task-builder-enabled` | `boolean` | `true` | Starts `ProjectionTaskBuilderWorker`. Set to `false` in runtimes that only run the executor. |
+| `task-executor-enabled` | `boolean` | `true` | Starts `ProjectionTaskExecutorWorker`. Set to `false` in runtimes that only run the task builder. |
+| `thread-count` | `int` | `10` | Number of in-process segment threads in `SegmentedWorkerPool`. Controls local parallelism and per-pot ordering. |
+| `queue-capacity` | `int` | `Integer.MAX_VALUE` | Per-segment in-process queue depth. Reduce this to apply tighter back pressure on the executor. |
+| `max-retries` | `int` | `3` | Maximum retry attempts for a failing task or outbox event before it is marked `FAILED`. |
+| `initial-backoff` | `Duration` | `100ms` | Starting backoff delay between retries. |
+| `max-backoff` | `Duration` | `2s` | Upper bound on exponential backoff delay between retries. |
+| `worker-id` | `String` | `"local"` | Diagnostic ID written to `claimed_by` on every claim. Set to a unique value per process in multi-process deployments (e.g., the pod name). |
+| `segment-index` | `int` | `0` | The inter-process segment this worker owns. Rows where `pot_partition_hash % segment-count = segment-index` are claimed by this process. |
+| `segment-count` | `int` | `1` | Total number of inter-process segments. Must be consistent across all workers sharing the same database. |
+| `task-builder-batch-size` | `int` | `100` | Maximum number of `business_event_outbox` rows claimed per polling cycle. |
+| `task-executor-batch-size` | `int` | `100` | Maximum number of `projection_tasks` rows claimed per polling cycle (further bounded by available queue capacity). |
+| `task-builder-polling-interval` | `Duration` | `250ms` | Maximum time the task builder waits for a wake signal before polling the database unconditionally. |
+| `task-executor-polling-interval` | `Duration` | `100ms` | Maximum time the task executor waits for a wake signal before polling the database unconditionally. |
+| `task-builder-lease-duration` | `Duration` | `30s` | How long a task builder claim is valid. After expiry, another worker may reclaim the row. |
+| `task-executor-lease-duration` | `Duration` | `30s` | How long a task executor claim is valid. |
+| `wake-signals-enabled` | `boolean` | `true` | Enables best-effort wake signals. When `false`, workers poll on timeout only. Disabling reduces load on NATS but increases average projection latency. |
+| `capacity-wakeup-min-interval` | `Duration` | `10ms` | Minimum interval between consecutive `CAPACITY_AVAILABLE` signals emitted by the executor. Prevents signal storms when queues drain quickly. |
+| `event-listener-enabled` | `boolean` | `false` | Enables the Spring `ApplicationEvent` listener that converts post-commit business events into `BUSINESS_EVENTS_AVAILABLE` signals. Typically enabled in monolith mode only; not needed when NATS is active. |
+
+<Note>
+  `initial-backoff` must be less than or equal to `max-backoff`. The
+  settings record constructor validates this at startup and throws
+  `IllegalArgumentException` if the constraint is violated.
+</Note>
+
+## NATS Properties (`pocoma.projection.nats`)
+
+These properties are read by both the task builder and the task executor runtimes. Each runtime reads only the subjects relevant to its own subscriptions and publications.
+
+| Property | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | `boolean` | `true` | Enables the NATS wake adapter. When `false`, the runtime uses Spring `ApplicationEvent` only (monolith mode). |
+| `servers` | `String` | `nats://localhost:4222` | Comma-separated list of Core NATS server URLs. |
+| `business-events-available-subject` | `String` | `pocoma.projection.business-events.available` | Subject the task builder subscribes to for `BUSINESS_EVENTS_AVAILABLE` signals. Also used by the API runtime to publish after transaction commit. |
+| `projection-tasks-available-subject` | `String` | `pocoma.projection.tasks.available` | Subject the task builder publishes to and the task executor subscribes to for `PROJECTION_TASKS_AVAILABLE` signals. |
+| `projection-tasks-processed-subject` | `String` | `pocoma.projection.tasks.processed` | Subject the task executor publishes to after a task reaches `DONE` or `FAILED`. Useful for downstream notification or monitoring. |
+
+<Warning>
+  All three NATS properties must agree across every runtime in a split
+  deployment. A mismatch (e.g., the task builder publishing to a different
+  subject than the executor subscribes to) will silently degrade to
+  polling-only behavior — no errors are thrown, but wake latency increases.
+</Warning>
+
+## Running Split-Mode Workers
+
+The following examples show how to start each runtime with explicit segment configuration, matching the examples in the project README.
+
+### Maven (`spring-boot:run`)
+
+```bash
+# API runtime — handles HTTP commands and queries only
+cd app
+./mvnw -pl runtime-web-api spring-boot:run \
+  -Dspring-boot.run.profiles=postgres
+
+# Task builder — segment 0 of 2
+./mvnw -pl runtime-business-events-outbox-dispatcher spring-boot:run \
+  -Dspring-boot.run.profiles=postgres \
+  -Dspring-boot.run.arguments="\
+    --pocoma.projection.worker.segment-index=0 \
+    --pocoma.projection.worker.segment-count=2"
+
+# Task builder — segment 1 of 2
+./mvnw -pl runtime-business-events-outbox-dispatcher spring-boot:run \
+  -Dspring-boot.run.profiles=postgres \
+  -Dspring-boot.run.arguments="\
+    --pocoma.projection.worker.segment-index=1 \
+    --pocoma.projection.worker.segment-count=2"
+
+# Task executor — segment 0 of 2
+./mvnw -pl runtime-balance-calculation-tasks-dispatcher spring-boot:run \
+  -Dspring-boot.run.profiles=postgres \
+  -Dspring-boot.run.arguments="\
+    --pocoma.projection.worker.segment-index=0 \
+    --pocoma.projection.worker.segment-count=2"
+```
+
+### Docker Compose (distributed mode)
+
+```bash
+# Starts one API runtime, two task builders, two task executors,
+# PostgreSQL, NATS, Prometheus, and Grafana.
+docker compose -f docker-compose.distributed.yml up --build
+```
+
+The distributed Compose file sets `POCOMA_PROJECTION_WORKER_SEGMENT_COUNT=2` for all dispatcher services. Services ending in `-0` own segment `0/2`; services ending in `-1` own segment `1/2`.
+
+Optional environment overrides for the distributed stack:
+
+```bash
+POSTGRES_DB=pocoma
+POSTGRES_USER=pocoma
+POSTGRES_PASSWORD=pocoma
+API_PORT=8080
+NATS_URL=nats://nats:4222
+POCOMA_SEGMENT_COUNT=2
+```
+
+### Spring Profile Shorthand
+
+The `segment-0-of-2` and `segment-1-of-2` Spring profiles pre-configure the segment properties for convenience:
+
+```bash
+./mvnw -pl runtime-business-events-outbox-dispatcher spring-boot:run \
+  -Dspring-boot.run.profiles=postgres,segment-0-of-2
+
+./mvnw -pl runtime-balance-calculation-tasks-dispatcher spring-boot:run \
+  -Dspring-boot.run.profiles=postgres,segment-1-of-2
+```
+
+<Tip>
+  For local development, `runtime-monolith` with the default H2 profile is the
+  simplest starting point — no Postgres or NATS required. Both
+  `task-builder-enabled` and `task-executor-enabled` default to `true`, so the
+  full pipeline runs in a single JVM.
+</Tip>

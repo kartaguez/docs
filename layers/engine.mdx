@@ -1,0 +1,206 @@
+---
+title: "Engine Layer: Use Cases and Ports in Pocoma"
+sidebarTitle: "Engine"
+description: "The engine layer defines Pocoma's use cases and port interfaces. It orchestrates business logic without depending on Spring, JPA, or HTTP."
+---
+
+The engine layer is the application's command and query orchestrator. It knows what the application can *do* — the use cases — and it defines *what it needs* from the outside world via port interfaces. Like the domain layer, the engine modules contain no Spring annotations, no JPA, and no HTTP; they are fully testable in isolation.
+
+<Note>
+The engine modules depend on `domain` and `domain-policy` but not on any infrastructure module. All I/O goes through port interfaces defined in the engine itself.
+</Note>
+
+---
+
+## Module layout
+
+```
+app/
+  engine-core/        UserContext, business events, version model, snapshot types,
+                        core outbound ports (transaction, outbox, balances, shareholders)
+  engine-command/     Command use cases, command intents, command services, context ports
+  engine-query/       Query use cases, query intents, query services, query ports
+  engine-projection/  Projection use cases (task builder + task executor), projection ports
+  engine-task-execution/    Generic pipeline task execution port and service
+  engine-task-materialization/ Generic task materialization port and service
+```
+
+---
+
+## Hexagonal port model
+
+Every boundary in the engine is expressed as a Java interface. Classes inside the engine never import concrete infrastructure classes.
+
+| Port direction | Location | Purpose |
+|---|---|---|
+| **Inbound** (driving) | `engine-command/port/in`, `engine-query/port/in`, `engine-projection/port/in` | Use case interfaces called by the supra layer |
+| **Outbound** (driven) | `engine-command/port/out`, `engine-query/port/out`, `engine-core/port/out`, `engine-projection/port/out` | Interfaces implemented by infra modules |
+
+The concrete service classes that implement the inbound port interfaces (e.g. `CreatePotService`, `GetPotService`) are package-private. External callers always hold the interface type, never the implementation.
+
+---
+
+## Command use cases
+
+All command use cases follow the signature `ResultSnapshot methodName(UserContext, XxxCommand)`. Commands are plain records validated in their compact constructors.
+
+<CardGroup cols={2}>
+  <Card title="CreatePotUseCase" icon="circle-plus">
+    Creates a new pot at version 1. Returns a `PotHeaderSnapshot`.
+  </Card>
+  <Card title="UpdatePotDetailsUseCase" icon="pen">
+    Updates a pot's `label`. Requires `expectedVersion`. Returns an updated `PotHeaderSnapshot`.
+  </Card>
+  <Card title="DeletePotUseCase" icon="trash">
+    Soft-deletes a pot. Requires `expectedVersion`. Returns the final `PotHeaderSnapshot`.
+  </Card>
+  <Card title="AddPotShareholdersUseCase" icon="user-plus">
+    Adds one or more shareholders to a pot. Requires `expectedVersion`. Returns a `PotShareholdersSnapshot`.
+  </Card>
+  <Card title="UpdatePotShareholdersDetailsUseCase" icon="address-card">
+    Updates names and optional user links for existing shareholders. Requires `expectedVersion`.
+  </Card>
+  <Card title="UpdatePotShareholdersWeightsUseCase" icon="sliders">
+    Adjusts the weight (cost share ratio) of existing shareholders. Requires `expectedVersion`.
+  </Card>
+  <Card title="CreateExpenseUseCase" icon="receipt">
+    Creates a new expense with payer, amount, label, and share weights. Requires `expectedVersion`. Returns an `ExpenseSharesSnapshot`.
+  </Card>
+  <Card title="UpdateExpenseDetailsUseCase" icon="file-pen">
+    Updates payer, amount, and label for an existing expense. Requires `expectedVersion`.
+  </Card>
+  <Card title="UpdateExpenseSharesUseCase" icon="chart-pie">
+    Replaces the share-weight distribution for an existing expense. Requires `expectedVersion`.
+  </Card>
+  <Card title="DeleteExpenseUseCase" icon="trash-can">
+    Soft-deletes an expense. Requires `expectedVersion`.
+  </Card>
+</CardGroup>
+
+---
+
+## Query use cases
+
+Queries are read-only; they apply the same authorization policies as direct views but never mutate state.
+
+| Use case | What it returns |
+|---|---|
+| `ListUserPotsUseCase` | All pots where the calling user is creator or shareholder |
+| `GetPotUseCase` | Full `PotViewSnapshot` (header + shareholders) at an optional version |
+| `ListPotExpensesUseCase` | Active expenses at an optional version |
+| `GetPotBalancesUseCase` | `PotBalancesSnapshot` at an optional version |
+| `ListUserPotBalancesUseCase` | Cross-pot balance summary for the calling user at an optional version |
+
+Queries accept an `OptionalLong version` parameter. When absent, the current version is used. When present, the query returns data as it existed at that specific version, enabling clients to read a consistent view after writing without relying on synchronous projections.
+
+---
+
+## Projection use cases
+
+Projection use cases are triggered by workers, not HTTP clients.
+
+| Use case | Description |
+|---|---|
+| `BuildProjectionTasksUseCase` | Consumes a `BuildProjectionTaskCommand` (wrapping a business event from `business_event_outbox`) and coalesces it into a `projection_task` record |
+| `ExecuteProjectionTasksUseCase` | Consumes an `ExecuteProjectionTaskCommand` (wrapping a claimed `projection_task`) and calls `PotBalancesCalculator` to compute and persist updated balances |
+| `ComputePotBalancesUseCase` | Internal helper invoked by `ExecuteProjectionTasksUseCase`; loads projected expenses and calls the domain calculator |
+
+---
+
+## Command execution flow
+
+<Steps>
+  <Step title="HTTP request arrives">
+    The supra layer reads `X-User-Id` and `X-User-Scopes` headers, constructs a `UserContext(UserId, Set<Scope>)`, and builds a typed command record (e.g. `UpdatePotDetailsCommand(potId, label, expectedVersion)`).
+  </Step>
+  <Step title="Use case is called">
+    The controller calls the use case interface (e.g. `updatePotDetailsUseCase.updatePotDetails(userContext, command)`). A `TransactionalXxxUseCase` wrapper ensures the entire execution runs within a single database transaction via the `TransactionRunner` port.
+  </Step>
+  <Step title="Precondition context is loaded">
+    The service calls an outbound context port (e.g. `PotContextPort.loadUpdatePotDetailsContext(potId)`) to retrieve the pot's current version, creator, and deleted flag atomically.
+  </Step>
+  <Step title="Optimistic version check">
+    The context record calls `assertUpdatePreconditions(command.expectedVersion())`. If the pot's `currentVersion != expectedVersion`, a `VersionConflictException` is thrown before any mutation occurs.
+  </Step>
+  <Step title="Authorization policy check">
+    The service calls the relevant domain policy (e.g. `updatePotDetailsAuthorizationPolicy.assertCanUpdatePotDetails(...)`). If the user lacks permission, a `BusinessRuleViolationException` is thrown.
+  </Step>
+  <Step title="Domain aggregate is mutated">
+    The aggregate method is called (e.g. `potHeader.updateDetails(Label.of(command.label()))`). The aggregate enforces remaining invariants (e.g. cannot mutate a deleted entity).
+  </Step>
+  <Step title="Version is incremented and persisted">
+    A new `PotGlobalVersion(potId, currentVersion + 1)` is constructed. `PotGlobalVersionPort.updateIfActive(currentVersion, nextVersion)` applies an atomic CAS update — if another request changed the version between load and persist, the update fails.
+  </Step>
+  <Step title="Business event is published to outbox">
+    The engine calls `EventPublisherPort.publish(new PotDetailsUpdatedEvent(potId, nextVersion))`. The infra adapter writes this into `business_event_outbox` and schedules a Spring `ApplicationEvent` to fire after the transaction commits (for monolith mode) or leaves it for NATS dispatcher polling (for distributed mode).
+  </Step>
+  <Step title="Snapshot is returned">
+    The service returns a versioned snapshot record (e.g. `PotHeaderSnapshot`) containing the new state and version number. The controller maps this to the HTTP response DTO.
+  </Step>
+</Steps>
+
+---
+
+## Optimistic concurrency
+
+Every mutating command carries an `expectedVersion` field. The engine rejects any command where `expectedVersion` does not match the pot's current active version.
+
+```java
+// From UpdatePotDetailsContext
+public void assertUpdatePreconditions(long expectedVersion) {
+    if (deleted) {
+        throw new BusinessRuleViolationException("POT_ALREADY_DELETED", ...);
+    }
+    if (expectedVersion != potGlobalVersion.version()) {
+        throw new VersionConflictException(
+            "Pot details cannot be updated because the expected version is not active");
+    }
+}
+```
+
+The `PotGlobalVersionPort.updateIfActive(currentVersion, nextVersion)` call then applies a database-level conditional update (a `WHERE version = ?` clause in the JPA adapter), providing a second safety net against concurrent writes that slip through between the load and the persist.
+
+<Warning>
+When a `VersionConflictException` is thrown, the HTTP layer returns `409 Conflict`. The client is responsible for re-fetching the current version and retrying if appropriate.
+</Warning>
+
+---
+
+## Business events
+
+After each successful command, the engine publishes one typed business event. These events are defined in `engine-core/event`:
+
+- `PotCreatedEvent`, `PotDetailsUpdatedEvent`, `PotDeletedEvent`
+- `PotShareholdersAddedEvent`, `PotShareholdersDetailsUpdatedEvent`, `PotShareholdersWeightsUpdatedEvent`
+- `ExpenseCreatedEvent`, `ExpenseDetailsUpdatedEvent`, `ExpenseSharesUpdatedEvent`, `ExpenseDeletedEvent`
+
+Each event carries a `PotId` and the new `version` number. Workers use these to trigger balance recalculation.
+
+---
+
+## Key outbound port interfaces
+
+| Port | Module | Purpose |
+|---|---|---|
+| `TransactionRunner` | `engine-core` | `runInTransaction(Supplier)` and `runAfterCommit(Runnable)` |
+| `PotGlobalVersionPort` | `engine-command` | Save/CAS-update the pot's version clock |
+| `PotHeaderPort` | `engine-command` | Save new or replace versioned `PotHeader` |
+| `PotContextPort` | `engine-command` | Load the precondition context for each command type |
+| `EventPublisherPort` | `engine-command` | Publish a business event (writes to outbox) |
+| `BusinessEventOutboxAppendPort` | `engine-core` | Append raw event to `business_event_outbox` |
+| `PotQueryPort` | `engine-query` | Read-side pot and shareholder queries |
+| `ExpenseQueryPort` | `engine-query` | Read-side expense queries |
+| `PotBalancesPort` | `engine-core` | Read and write computed balance projections |
+| `BusinessEventOutboxPort` | `engine-projection` | Claim and ack events from `business_event_outbox` |
+| `ProjectionTaskPort` | `engine-projection` | Claim and ack tasks from `projection_tasks` |
+| `ProjectedExpensePort` | `engine-projection` | Load the projected expense snapshots used by the calculator |
+
+---
+
+## When to modify this layer
+
+- **New command**: create a command record in `engine-command/port/in/command/intent`, a use case interface in `.../usecase`, a service in `.../service/command`, and a transactional wrapper in `.../service/transaction/command`. Wire everything in `CommandUseCaseFactory`.
+- **New query**: follow the same pattern under `engine-query`.
+- **New outbound port**: define the interface in the appropriate `engine-*/port/out` package and implement it in `infra-persistence-jpa` or another infra module.
+- **New authorization logic**: add the check to an existing authorization policy in `domain-policy`, or create a new policy class and inject it into the relevant engine service.
+- **Changing the version-conflict behavior**: modify `assertUpdatePreconditions` in the relevant context record or `PotGlobalVersionPort.updateIfActive` in the JPA adapter.

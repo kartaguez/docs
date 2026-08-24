@@ -1,0 +1,76 @@
+---
+title: "Pocoma: What It Is and How It Works"
+sidebarTitle: "Introduction"
+description: "Pocoma manages shared expense pots: users create pots, add participants, record expenses, and the system computes balances via an async projection pipeline."
+---
+
+## What Pocoma Does
+
+Pocoma is a REST API for managing shared expense pots. The typical lifecycle looks like this:
+
+1. A user **creates a pot** with a name and optional details.
+2. The creator **adds shareholders** (participants) to the pot, optionally assigning fractional weights that determine how expenses are split.
+3. Any participant **records expenses** against the pot, specifying an amount and how the cost is distributed across shareholders.
+4. The system **computes balances** between participants asynchronously and exposes them via a query endpoint.
+
+The API surfaces five main resource types — **Pots**, **Shareholders**, **Expenses**, **Balances**, and their **Versions** — and enforces that every write is safe under concurrent access.
+
+---
+
+## How the Write Side Works
+
+Every state-changing operation is a **command**. Commands mutate the versioned state of a pot:
+
+- Creating or deleting a pot
+- Updating pot details
+- Adding or updating shareholders and their weights
+- Creating, updating, or deleting expenses
+
+Each pot carries a **global version number** that increments with every successful write. All write requests must supply an `expectedVersion` field. If the version on the server does not match, the command is rejected with a conflict error. This is **optimistic concurrency control** — it prevents two concurrent writers from silently overwriting each other's changes without using pessimistic database locks.
+
+After a command is persisted, Pocoma writes a **business event** into the `business_event_outbox` table in the same transaction. This event is the trigger for the async projection pipeline.
+
+<Note>
+  Commands are always transactional. If the command fails for any reason — version mismatch, validation error, business rule violation — the business event is never written and the pot state is unchanged.
+</Note>
+
+---
+
+## How the Read Side Works
+
+Queries return **versioned views** of the pot's state. You can request the current version (the default) or pin a query to a specific historical version. Views respect read policies: deleted entities are hidden from list endpoints but visible from direct-access endpoints (with a `deleted: true` flag).
+
+**Balances are projections**, not computed inline. They are derived asynchronously by the projection pipeline from the business events. This means:
+
+- Balance queries may temporarily lag behind the latest write version.
+- The `version` field in a balance snapshot tells you which pot version it was computed from.
+- Projection lag is measurable via Prometheus metrics and is intentionally observable rather than hidden.
+
+<Tip>
+  If your integration needs up-to-date balances, poll the balance endpoint and compare the returned `version` with the pot's current `version`. When they match, the projection has caught up.
+</Tip>
+
+---
+
+## Authentication: The `X-User-Id` Header
+
+Pocoma does not implement a full authentication framework. Callers identify themselves by passing a `X-User-Id` header on every request:
+
+```http
+X-User-Id: user-42
+```
+
+The engine applies read policies based on this value — for example, `ListUserPotBalancesQuery` returns balances only for pots accessible to the calling user. There is no token validation or session management; `X-User-Id` is trusted as-is, making it straightforward to test any user context.
+
+---
+
+## Key Concepts
+
+| Concept | Description |
+|---|---|
+| **Pot** | The core aggregate. Holds metadata, a list of shareholders, and a list of expenses. Every pot has a monotonically increasing `version`. |
+| **Shareholder** | A participant in a pot. Has an optional fractional weight used to proportionally split expenses. |
+| **Expense** | A recorded cost within a pot. Specifies an amount and how that amount is distributed across shareholders as shares. |
+| **Balance** | The net amount each shareholder owes or is owed within a pot. Computed asynchronously by `PotBalancesCalculator`. |
+| **Version** | An integer that increments on every successful write. Used for optimistic concurrency (`expectedVersion`) and for targeting specific historical views. |
+| **Projection** | The async process that reads business events from the outbox and computes balance snapshots, storing results in `pot_balance_*` tables. |

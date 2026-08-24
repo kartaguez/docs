@@ -1,0 +1,169 @@
+---
+title: "Pocoma Architecture: Hexagonal Design and Async Projections"
+sidebarTitle: "Architecture"
+description: "Pocoma uses hexagonal architecture with a pure domain, a use-case engine, and pluggable infrastructure adapters. Balances are computed by an async projection pipeline."
+---
+
+## Layered Architecture
+
+Pocoma is organized around four concentric layers. Arrows represent allowed dependency direction — inner layers know nothing about outer layers.
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│                        SUPRA LAYER                          │
+│  supra-http-rest-spring  (REST controllers, DTOs)           │
+│  supra-dispatcher-*      (NATS/Spring projection workers)   │
+│  supra-worker-*          (Spring-event-driven workers)      │
+│                                                             │
+│   ┌─────────────────────────────────────────────────────┐   │
+│   │                   ENGINE LAYER                      │   │
+│   │  engine-command   (command use cases)               │   │
+│   │  engine-query     (query use cases)                 │   │
+│   │  engine-projection (projection use cases)           │   │
+│   │  engine-core      (shared ports, events, types)     │   │
+│   │                                                     │   │
+│   │   ┌───────────────────────────────────────────┐     │   │
+│   │   │              DOMAIN LAYER                 │     │   │
+│   │   │  domain          (Pot, Shareholder, ...)  │     │   │
+│   │   │  domain-policy   (authorization rules)    │     │   │
+│   │   │  domain-projection (PotBalancesCalculator)│     │   │
+│   │   │  domain-pipeline-tasks (task types)       │     │   │
+│   │   └───────────────────────────────────────────┘     │   │
+│   └─────────────────────────────────────────────────────┘   │
+│                                                             │
+│  INFRASTRUCTURE LAYER (plugs into engine ports)             │
+│  infra-persistence-jpa   (JPA adapters for H2/PostgreSQL)   │
+│  infra-tx-spring         (Spring transaction adapter)       │
+│  infra-event-publisher-spring  (Spring event publishing)    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Hexagonal Architecture
+
+Pocoma applies hexagonal (ports-and-adapters) architecture strictly:
+
+- **Domain** has zero external dependencies. `Pot`, `Shareholder`, `Expense`, value objects, factories, and `PotBalancesCalculator` are all plain Java. They can be tested with no Spring context, no JPA, and no HTTP.
+- **Engine** depends only on domain types and its own **port interfaces** (`PotRepositoryPort`, `EventPublisherPort`, `TransactionPort`, etc.). It has no knowledge of JPA, Spring, or HTTP.
+- **Infrastructure modules** (`infra-*`) implement engine ports using JPA repositories, Spring transactions, and Spring events. They are swappable — the H2 and PostgreSQL implementations live behind the same port.
+- **Supra modules** (`supra-*`) are the technology-facing entry points: REST controllers that translate HTTP requests into engine commands/queries, and dispatcher workers that consume the projection pipeline. They depend on engine ports, not on domain internals.
+
+This separation has concrete payoffs:
+
+- Business rules are unit-testable without standing up a Spring context.
+- The same command use case runs identically in the monolith and in the split-runtime deployment.
+- Swapping the database from H2 to PostgreSQL requires only a profile change, not a code change.
+
+---
+
+## Command / Query Split
+
+Pocoma separates all state-changing operations (commands) from all read operations (queries).
+
+**Commands** (`engine-command`):
+1. Validate the incoming intent against domain rules.
+2. Load the current aggregate state via `PotRepositoryPort`.
+3. Apply the domain mutation (e.g., `PotFactory`, aggregate methods).
+4. Persist the updated state.
+5. Publish a business event to `business_event_outbox` via `EventPublisherPort` — **within the same transaction**.
+
+The business event write is in the same transaction as the state write. There is no two-phase commit: if the transaction rolls back, neither the new state nor the event reaches the database.
+
+**Queries** (`engine-query`):
+1. Apply read policies (e.g., check caller has access via `X-User-Id`).
+2. Load views directly from repository ports.
+3. Return immutable snapshots — never domain aggregates.
+
+Queries are read-only and never emit events. Balance queries read from the `pot_balance_*` projection tables, not from the write-side aggregates.
+
+---
+
+## Projection Pipeline
+
+Balances are not computed synchronously. Instead, every successful command triggers an async projection pipeline:
+
+```text
+┌──────────────────┐
+│  HTTP Command    │
+└────────┬─────────┘
+         │ (same transaction)
+         ▼
+┌──────────────────────────┐
+│  business_event_outbox   │  ← durable source of truth for pending work
+└────────┬─────────────────┘
+         │ NATS wake signal / Spring event / timeout poll
+         ▼
+┌────────────────────────────────────────┐
+│  Task Builder Worker                   │
+│  (BuildProjectionTasksUseCase)         │  ← coalesces events per pot
+└────────┬───────────────────────────────┘
+         │ upserts or raises target_version
+         ▼
+┌──────────────────────────┐
+│    projection_tasks      │  ← one active task per pot
+└────────┬─────────────────┘
+         │ NATS wake signal / timeout poll
+         ▼
+┌────────────────────────────────────────┐
+│  Task Executor Worker                  │
+│  (ExecuteProjectionTasksUseCase)       │  ← claims tasks by segment
+└────────┬───────────────────────────────┘
+         │
+         ▼
+┌────────────────────────────────────────┐
+│  PotBalancesCalculator                 │  ← pure, deterministic, no Spring
+└────────┬───────────────────────────────┘
+         │
+         ▼
+┌───────────────────────────┐
+│  pot_balance_* tables     │  ← queried by GetPotBalancesUseCase
+└───────────────────────────┘
+```
+
+Key design decisions in the pipeline:
+
+- **The database is the source of truth for pending work.** NATS and Spring events are best-effort wake signals only — they carry a `potId` but never event payloads or task IDs. If a signal is lost, the next polling timeout recovers.
+- **Task coalescing.** If multiple events arrive for the same pot before the task builder processes them, they are merged into a single `projection_tasks` row with the highest `target_version`. This prevents redundant balance computations under burst load.
+- **At-least-once execution.** Duplicate execution is safe because `PotBalancesCalculator` is deterministic and projection persistence uses optimistic state progression on `(potId, targetVersion)`.
+- **Inter-process partitioning.** Workers are partitioned by a stable hash of `potId` (`pot_partition_hash % segmentCount = segmentIndex`). A hot pot always belongs to exactly one worker segment, preventing race conditions between worker processes.
+- **In-process ordering.** Within a single worker process, `SegmentedWorkerPool` routes tasks for the same `potId` to the same local queue, preserving per-pot ordering.
+
+<Note>
+  Claim tokens, not worker IDs, enforce ownership. Every claim writes a random token. State transitions include that token in the `WHERE` clause, so a worker whose lease expired cannot complete a task it no longer owns.
+</Note>
+
+---
+
+## Explore the Layers
+
+<CardGroup cols={2}>
+  <Card
+    title="Domain Layer"
+    icon="cube"
+    href="/layers/domain"
+  >
+    Pure business model: Pot, Shareholder, Expense, value objects, factories, and PotBalancesCalculator.
+  </Card>
+  <Card
+    title="Engine Layer"
+    icon="gear"
+    href="/layers/engine"
+  >
+    Use cases, port interfaces, and the command/query/projection split.
+  </Card>
+  <Card
+    title="Infrastructure Layer"
+    icon="database"
+    href="/layers/infra"
+  >
+    JPA adapters, Spring transactions, and the event publisher that plugs into engine ports.
+  </Card>
+  <Card
+    title="Supra Layer"
+    icon="plug"
+    href="/layers/supra"
+  >
+    REST controllers, DTOs, and the NATS/Spring projection dispatcher workers.
+  </Card>
+</CardGroup>

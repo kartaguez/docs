@@ -1,0 +1,216 @@
+---
+title: "Running Pocoma in Split / Distributed Mode"
+sidebarTitle: "Distributed"
+description: "Run Pocoma's HTTP API, business-event task builders, and balance-task executors as separate processes with worker segmentation for horizontal scalability."
+---
+
+Split mode decomposes `runtime-monolith` into dedicated runtimes, each owning a
+single responsibility. This matches the target production deployment shape and
+enables each tier to be scaled, restarted, and observed independently.
+
+<Note>
+  NATS is required in split mode. Each dispatcher runtime subscribes to
+  best-effort wake signals over Core NATS. Without NATS, workers fall back to
+  polling on a configured timeout interval — the system remains correct but
+  reacts to new work more slowly.
+</Note>
+
+---
+
+## The Five Dedicated Runtimes
+
+<CardGroup cols={2}>
+  <Card title="runtime-web-api" icon="globe">
+    **HTTP API only.** Accepts commands and queries, persists business state, and
+    writes to `business_event_outbox`. No projection workers run inside this
+    process.
+  </Card>
+  <Card title="runtime-business-events-outbox-dispatcher" icon="database">
+    **Task builder.** Reads `business_event_outbox`, coalesces balance-impacting
+    events into `projection_tasks`, and publishes
+    `PROJECTION_TASKS_AVAILABLE(potId)` wake signals.
+  </Card>
+  <Card title="runtime-balance-calculation-tasks-dispatcher" icon="calculator">
+    **Task executor.** Reads `projection_tasks`, calls
+    `ExecuteProjectionTasksUseCase`, and writes results to the
+    `pot_balance_*` projection tables.
+  </Card>
+  <Card title="runtime-task-materialization-dispatcher" icon="layer-group">
+    **Task materialization dispatcher.** Handles the materialization stage of the
+    projection pipeline for derived read models.
+  </Card>
+  <Card title="runtime-pipeline-task-executor" icon="gears">
+    **Pipeline task executor.** Executes generic pipeline tasks produced earlier
+    in the projection chain.
+  </Card>
+</CardGroup>
+
+---
+
+## Worker Segmentation
+
+Pocoma partitions projection work across dispatcher processes using a **stable
+`potId` hash**:
+
+- Each row in `business_event_outbox` and `projection_tasks` stores a
+  `pot_partition_hash` computed from `potId`.
+- A worker with `segment-index=N` of `segment-count=M` only claims rows where
+  `pot_partition_hash % M = N`.
+- A hot pot therefore belongs to **exactly one segment** — it is woken and
+  processed by only one logical worker group at any time.
+
+There are two distinct segmentation concepts:
+
+| Concept | Property | Scope |
+|---|---|---|
+| **Inter-process partition** | `pocoma.projection.worker.segment-index` / `segment-count` | Which database rows this process may claim |
+| **In-process executor segments** | `pocoma.projection.worker.thread-count` | How many local queues preserve per-`potId` order inside the process |
+
+---
+
+## Starting Split Mode
+
+All runtimes require PostgreSQL. Start your database before launching any Java
+process (see [Docker Compose](/runtimes/docker-compose) for a pre-wired stack).
+
+<Steps>
+  <Step title="Start the HTTP API">
+    The API runtime uses the `postgres` profile only — it has no worker configuration:
+
+    ```bash
+    cd app
+    ./mvnw -pl runtime-web-api spring-boot:run \
+      -Dspring-boot.run.profiles=postgres
+    ```
+
+    The API is available at `http://localhost:8080`.
+  </Step>
+
+  <Step title="Start business-event dispatcher — segment 0">
+    This process claims rows where `pot_partition_hash % 2 = 0`:
+
+    ```bash
+    ./mvnw -pl runtime-business-events-outbox-dispatcher spring-boot:run \
+      -Dspring-boot.run.profiles=postgres \
+      -Dspring-boot.run.arguments="--pocoma.projection.worker.segment-index=0 \
+        --pocoma.projection.worker.segment-count=2"
+    ```
+  </Step>
+
+  <Step title="Start business-event dispatcher — segment 1">
+    This process claims the other half of the outbox:
+
+    ```bash
+    ./mvnw -pl runtime-business-events-outbox-dispatcher spring-boot:run \
+      -Dspring-boot.run.profiles=postgres \
+      -Dspring-boot.run.arguments="--pocoma.projection.worker.segment-index=1 \
+        --pocoma.projection.worker.segment-count=2"
+    ```
+  </Step>
+
+  <Step title="Start balance-calculation dispatcher — segment 0">
+    Picks up `projection_tasks` for segment 0 and executes balance computation:
+
+    ```bash
+    ./mvnw -pl runtime-balance-calculation-tasks-dispatcher spring-boot:run \
+      -Dspring-boot.run.profiles=postgres \
+      -Dspring-boot.run.arguments="--pocoma.projection.worker.segment-index=0 \
+        --pocoma.projection.worker.segment-count=2"
+    ```
+  </Step>
+
+  <Step title="(Optional) Start additional executor segments">
+    To add a second balance-calculation executor, launch another instance with
+    `segment-index=1`:
+
+    ```bash
+    ./mvnw -pl runtime-balance-calculation-tasks-dispatcher spring-boot:run \
+      -Dspring-boot.run.profiles=postgres \
+      -Dspring-boot.run.arguments="--pocoma.projection.worker.segment-index=1 \
+        --pocoma.projection.worker.segment-count=2"
+    ```
+  </Step>
+</Steps>
+
+---
+
+## The Projection Pipeline in Split Mode
+
+```text
+HTTP command (runtime-web-api)
+  → command transaction persists business state
+  → business_event_outbox row written
+
+runtime-business-events-outbox-dispatcher (segment N)
+  → woken by NATS: pocoma.projection.business-events.available
+  → claims outbox rows for its pot_partition_hash segment
+  → creates / coalesces projection_tasks rows
+  → publishes NATS: pocoma.projection.tasks.available
+
+runtime-balance-calculation-tasks-dispatcher (segment N)
+  → woken by NATS: pocoma.projection.tasks.available
+  → claims projection_tasks rows for its segment
+  → SegmentedWorkerPool → ExecuteProjectionTasksUseCase
+  → writes pot_balance_* projection tables
+  → publishes NATS: pocoma.projection.tasks.processed
+```
+
+<Warning>
+  Wake signals are **best-effort hints only** — they carry a `signal` type and
+  `potId` but never task payloads or versions. If a signal is lost, the worker
+  falls back to its configured polling interval. The database remains the
+  authoritative source of pending work.
+</Warning>
+
+---
+
+## NATS Wake Signal Payload
+
+```json
+{
+  "signal": "BUSINESS_EVENTS_AVAILABLE",
+  "potId": "pot-123",
+  "occurredAt": "2026-05-02T22:00:00Z"
+}
+```
+
+The payload is intentionally minimal. NATS carries only wake intent; it never
+acts as a durable work queue.
+
+---
+
+## Key Spring Configuration Properties
+
+All projection worker properties use the `pocoma.projection.worker` prefix:
+
+| Property | Description |
+|---|---|
+| `segment-index` | Inter-process segment owned by this worker (0-based) |
+| `segment-count` | Total number of inter-process segments |
+| `thread-count` | In-process executor segment count (per-`potId` ordering) |
+| `task-builder-enabled` | Enables the task-builder worker in this process |
+| `task-executor-enabled` | Enables the task-executor worker in this process |
+| `task-builder-polling-interval` | Maximum wait before re-polling when no wake signal arrives |
+| `task-executor-polling-interval` | Same, for the executor side |
+| `task-builder-lease-duration` | Claim lease duration for outbox rows |
+| `task-executor-lease-duration` | Claim lease duration for projection task rows |
+| `wake-signals-enabled` | Toggle best-effort wake signals; workers still run by timeout if disabled |
+
+NATS configuration uses the `pocoma.projection.nats` prefix:
+
+| Property | Description |
+|---|---|
+| `enabled` | Activates NATS wake subscription and publication |
+| `servers` | Core NATS server list (default: `nats://localhost:4222`) |
+| `business-events-available-subject` | Inbound subject for task-builder wakes |
+| `projection-tasks-available-subject` | Outbound subject after tasks are ready |
+| `projection-tasks-processed-subject` | Outbound subject after durable task completion |
+
+---
+
+<Tip>
+  `runtime-monolith` still supports the `api` and `worker` Spring profiles for
+  lightweight local experiments. For anything resembling a production topology —
+  load testing, segmentation validation, or projection backpressure measurement —
+  use the dedicated runtimes documented above.
+</Tip>

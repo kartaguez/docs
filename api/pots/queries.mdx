@@ -1,0 +1,259 @@
+---
+title: "Pot Query Endpoints: List and Get Pots and Expenses"
+sidebarTitle: "Pot Queries"
+description: "REST endpoints for reading pot state: GET /api/pots (list), GET /api/pots/{potId} (detail), GET /api/pots/{potId}/expenses (list expenses)."
+---
+
+This page documents the read-only query endpoints under `/api/pots`. These endpoints never modify state and can safely be retried.
+
+## Headers
+
+| Header | Required | Description |
+|---|---|---|
+| `X-User-Id` | **Required** | UUID of the calling user. |
+| `X-User-Scopes` | **Required** | Semicolon-separated scopes. All read endpoints require at least `pot:read`. |
+
+<Note>
+  All query endpoints accept an optional `?version=N` query parameter. When supplied, the API
+  returns the state of the resource as it was **at that version** rather than the latest state.
+  This is useful for audit trails, debugging, and replaying historical views.
+</Note>
+
+---
+
+## `GET /api/pots` — List accessible pots
+
+Returns a flat list of all pots accessible to the authenticated user. Soft-deleted pots are included in the list; inspect the `deleted` flag to filter them out if needed.
+
+**Required scope:** `pot:read`
+
+### Query parameters
+
+_None._
+
+### Response body
+
+An array of `PotResponse` objects.
+
+<ResponseField name="[].id" type="string">UUID of the pot.</ResponseField>
+<ResponseField name="[].label" type="string">Human-readable name of the pot.</ResponseField>
+<ResponseField name="[].creatorId" type="string">UUID of the user who created the pot.</ResponseField>
+<ResponseField name="[].deleted" type="boolean">
+  `true` if the pot has been soft-deleted. Deleted pots are still returned so clients can
+  display historical context.
+</ResponseField>
+<ResponseField name="[].version" type="integer">
+  Current version of the pot. Use this value as `expectedVersion` in a subsequent command.
+</ResponseField>
+
+### Example
+
+```bash
+curl http://localhost:8080/api/pots \
+  -H "X-User-Id: 22222222-2222-2222-2222-222222222222" \
+  -H "X-User-Scopes: pot:read"
+```
+
+```json
+[
+  {
+    "id": "550e8400-e29b-41d4-a716-446655440000",
+    "label": "Summer Road Trip",
+    "creatorId": "22222222-2222-2222-2222-222222222222",
+    "deleted": false,
+    "version": 6
+  },
+  {
+    "id": "660f9511-f30c-52e5-b827-557766551111",
+    "label": "Office Lunch Fund",
+    "creatorId": "22222222-2222-2222-2222-222222222222",
+    "deleted": false,
+    "version": 3
+  }
+]
+```
+
+---
+
+## `GET /api/pots/{potId}` — Get a pot
+
+Returns the full view of a single pot, including its header details and the complete list of shareholders. Returns `200 OK` on success.
+
+**Required scope:** `pot:read`
+
+### Path parameters
+
+<ParamField path="potId" type="string" required>
+  UUID of the pot to retrieve.
+</ParamField>
+
+### Query parameters
+
+<ParamField query="version" type="integer">
+  Optional. When provided, returns the pot state as it was at this version number, enabling historical reads. Omit to retrieve the latest state.
+</ParamField>
+
+### Response body
+
+<ResponseField name="header" type="object">
+  Top-level pot information.
+  <Expandable title="PotResponse (header)">
+    <ResponseField name="id" type="string">UUID of the pot.</ResponseField>
+    <ResponseField name="label" type="string">Current label of the pot.</ResponseField>
+    <ResponseField name="creatorId" type="string">UUID of the pot's creator.</ResponseField>
+    <ResponseField name="deleted" type="boolean">
+      `true` if the pot has been soft-deleted.
+    </ResponseField>
+    <ResponseField name="version" type="integer">Version of the pot at which this data was read.</ResponseField>
+  </Expandable>
+</ResponseField>
+<ResponseField name="shareholders" type="object">
+  Shareholder roster for the pot.
+  <Expandable title="PotShareholdersResponse">
+    <ResponseField name="potId" type="string">UUID of the pot (mirrors `header.id`).</ResponseField>
+    <ResponseField name="shareholders" type="array">
+      List of all shareholders, including soft-deleted ones.
+      <Expandable title="ShareholderResponse">
+        <ResponseField name="id" type="string">UUID of the shareholder.</ResponseField>
+        <ResponseField name="potId" type="string">UUID of the owning pot.</ResponseField>
+        <ResponseField name="name" type="string">Display name of the shareholder.</ResponseField>
+        <ResponseField name="weight" type="object">
+          Fractional weight `{ numerator, denominator }`. For example, `{ "numerator": 2, "denominator": 3 }` means this shareholder bears ⅔ of expenses by default.
+        </ResponseField>
+        <ResponseField name="userId" type="string">
+          UUID of the linked application user, or `null` if not yet linked.
+        </ResponseField>
+        <ResponseField name="deleted" type="boolean">
+          `true` if this shareholder has been removed from the pot.
+        </ResponseField>
+      </Expandable>
+    </ResponseField>
+    <ResponseField name="version" type="integer">Version at which this shareholder data was read.</ResponseField>
+  </Expandable>
+</ResponseField>
+
+<Note>
+  The `deleted` flag on a **shareholder** indicates that the individual participant was removed from the pot, while the `deleted` flag on the **header** indicates the entire pot was deleted. Both can appear in a single response for historical views.
+</Note>
+
+### Example — current state
+
+```bash
+curl http://localhost:8080/api/pots/550e8400-e29b-41d4-a716-446655440000 \
+  -H "X-User-Id: 22222222-2222-2222-2222-222222222222" \
+  -H "X-User-Scopes: pot:read"
+```
+
+```json
+{
+  "header": {
+    "id": "550e8400-e29b-41d4-a716-446655440000",
+    "label": "Summer Road Trip",
+    "creatorId": "22222222-2222-2222-2222-222222222222",
+    "deleted": false,
+    "version": 6
+  },
+  "shareholders": {
+    "potId": "550e8400-e29b-41d4-a716-446655440000",
+    "shareholders": [
+      {
+        "id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        "potId": "550e8400-e29b-41d4-a716-446655440000",
+        "name": "Alice",
+        "weight": { "numerator": 2, "denominator": 3 },
+        "userId": "22222222-2222-2222-2222-222222222222",
+        "deleted": false
+      },
+      {
+        "id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        "potId": "550e8400-e29b-41d4-a716-446655440000",
+        "name": "Bob",
+        "weight": { "numerator": 1, "denominator": 3 },
+        "userId": "33333333-3333-3333-3333-333333333333",
+        "deleted": false
+      }
+    ],
+    "version": 6
+  }
+}
+```
+
+### Example — historical read at version 3
+
+```bash
+curl "http://localhost:8080/api/pots/550e8400-e29b-41d4-a716-446655440000?version=3" \
+  -H "X-User-Id: 22222222-2222-2222-2222-222222222222" \
+  -H "X-User-Scopes: pot:read"
+```
+
+---
+
+## `GET /api/pots/{potId}/expenses` — List pot expenses
+
+Returns a summary list of all expenses recorded against the pot, ordered by version. Soft-deleted expenses are included; use the `deleted` flag to filter if needed.
+
+**Required scope:** `pot:read`
+
+### Path parameters
+
+<ParamField path="potId" type="string" required>
+  UUID of the pot whose expenses to list.
+</ParamField>
+
+### Query parameters
+
+<ParamField query="version" type="integer">
+  Optional. Returns the expense list as it looked at this pot version. Omit for the latest list.
+</ParamField>
+
+### Response body
+
+An array of `ExpenseHeaderResponse` objects.
+
+<ResponseField name="[].id" type="string">UUID of the expense.</ResponseField>
+<ResponseField name="[].potId" type="string">UUID of the owning pot.</ResponseField>
+<ResponseField name="[].payerId" type="string">UUID of the shareholder who paid.</ResponseField>
+<ResponseField name="[].amount" type="object">
+  Monetary amount as a fraction.
+  <Expandable title="FractionResponse">
+    <ResponseField name="numerator" type="integer">Numerator of the amount fraction.</ResponseField>
+    <ResponseField name="denominator" type="integer">Denominator of the amount fraction.</ResponseField>
+  </Expandable>
+</ResponseField>
+<ResponseField name="[].label" type="string">Human-readable description of the expense.</ResponseField>
+<ResponseField name="[].deleted" type="boolean">
+  `true` if the expense has been soft-deleted.
+</ResponseField>
+<ResponseField name="[].version" type="integer">
+  Version of the event log at which this expense was last modified.
+</ResponseField>
+
+### Example
+
+```bash
+curl http://localhost:8080/api/pots/550e8400-e29b-41d4-a716-446655440000/expenses \
+  -H "X-User-Id: 22222222-2222-2222-2222-222222222222" \
+  -H "X-User-Scopes: pot:read"
+```
+
+```json
+[
+  {
+    "id": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+    "potId": "550e8400-e29b-41d4-a716-446655440000",
+    "payerId": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+    "amount": { "numerator": 42, "denominator": 1 },
+    "label": "Lunch",
+    "deleted": false,
+    "version": 6
+  }
+]
+```
+
+### Example — historical read at version 5
+
+```bash
+curl "http://localhost:8080/api/pots/550e8400-e29b-41d4-a716-446655440000/expenses?version=5" \
+  -H "X-User-Id: 22222222-2222-2222-2222-222222222222" \
+  -H "X-User-Scopes: pot:read"
+```

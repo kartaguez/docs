@@ -1,0 +1,193 @@
+---
+title: "Supra Layer: HTTP, Workers, and Technology Adapters"
+sidebarTitle: "Supra"
+description: "The supra modules wire external-facing technology: REST controllers, projection worker dispatchers, and NATS messaging adapters."
+---
+
+The supra layer is the outermost ring of Pocoma's hexagonal architecture. It contains all inbound adapters: the HTTP API that translates REST requests into engine commands and queries, and the worker dispatchers that poll durable outbox tables and drive the asynchronous projection pipeline. Supra modules may import Spring, NATS, and other technology libraries freely; the engine and domain modules never depend on them.
+
+<Note>
+Supra modules call inbound port interfaces defined in the engine. They never import domain aggregates directly and never hold a reference to any infra adapter. The dependency always flows inward.
+</Note>
+
+---
+
+## Module layout
+
+```
+app/
+  supra-http-rest-spring/                         REST controllers, DTOs, mappers, error handling
+  supra-dispatcher-business-events-outbox-nats/   NATS-backed task builder worker (stage 1)
+  supra-dispatcher-balance-calculation-tasks-outbox-nats/  NATS-backed task executor (stage 2)
+  supra-dispatcher-pipeline-tasks/                Generic pipeline task dispatcher
+  supra-dispatcher-task-materialization-nats/     NATS-backed task materialization dispatcher
+  supra-worker-balance-calculation-events-spring/ Spring event-driven balance worker (monolith)
+  orchestrator-claimable-work-dispatcher/         Shared claimable-work engine used by all dispatchers
+```
+
+---
+
+## `supra-http-rest-spring`
+
+This module is a standard Spring MVC module. It registers four `@RestController` classes, each mapped to `/api/pots`.
+
+### Controllers
+
+<CardGroup cols={2}>
+  <Card title="PotsCommandController" icon="pen-to-square">
+    Handles all pot and shareholder mutation endpoints, plus expense creation.
+    Routes: `POST /api/pots`, `PATCH /{potId}/details`, `DELETE /{potId}`, `POST /{potId}/shareholders`, `PATCH /{potId}/shareholders/details`, `PATCH /{potId}/shareholders/weights`, `POST /{potId}/expenses`.
+  </Card>
+  <Card title="ExpensesCommandController" icon="receipt">
+    Handles expense mutation endpoints.
+    Routes: `PATCH /{potId}/expenses/{expenseId}/details`, `PATCH /{potId}/expenses/{expenseId}/shares`, `DELETE /{potId}/expenses/{expenseId}`.
+  </Card>
+  <Card title="PotsQueryController" icon="magnifying-glass">
+    Handles all pot-level read endpoints.
+    Routes: `GET /api/pots`, `GET /api/pots/balances/me`, `GET /{potId}`, `GET /{potId}/expenses`, `GET /{potId}/balances`.
+  </Card>
+  <Card title="ExpensesQueryController" icon="list">
+    Handles expense-level read endpoints.
+    Routes: `GET /{potId}/expenses/{expenseId}`.
+  </Card>
+</CardGroup>
+
+### User identity via headers
+
+Every request must carry two HTTP headers:
+
+| Header | Required | Format | Purpose |
+|---|---|---|---|
+| `X-User-Id` | Yes | UUID string | Identifies the calling user |
+| `X-User-Scopes` | Yes | Semicolon-delimited scope strings | Grants permissions (e.g. `pot:create;pot:read;expense:create`) |
+
+`UserContextFactory.fromHeaders(userId, userScopes)` parses both headers into a `UserContext(UserId, Set<Scope>)` record that is passed to every use case call. If either header is absent or malformed, the factory throws `InvalidRequestException`, which maps to `400 Bad Request`.
+
+```java
+// Example: how the controller creates a UserContext
+UserContext userContext = UserContextFactory.fromHeaders(
+    request.getHeader("X-User-Id"),
+    request.getHeader("X-User-Scopes")
+);
+```
+
+<Note>
+There is no authentication middleware or JWT verification. The `X-User-Id` and `X-User-Scopes` headers are trusted as-is. In a production deployment a gateway or sidecar would validate credentials and inject these headers before the request reaches Pocoma. See [api/authentication](/api/authentication) for details.
+</Note>
+
+### DTOs and mappers
+
+Request DTOs live in `dto/request` and response DTOs in `dto/response`. All DTO classes are plain Java records. Amounts and weights use separate `numerator` / `denominator` fields so that clients can express exact fractions without floating-point serialization artifacts.
+
+`RestMapper` is a stateless utility class that maps engine snapshot records to response DTOs. Add a new mapping method here when introducing a new response shape.
+
+`FractionResponse` wraps the `numerator` and `denominator` of a `Fraction` for JSON serialization. Balance values in responses are always fractions, not decimals, preserving the exact arithmetic used throughout the domain.
+
+### Error handling
+
+`RestExceptionHandler` (`@RestControllerAdvice`) maps engine and domain exceptions to HTTP status codes:
+
+| Exception | HTTP status |
+|---|---|
+| `InvalidRequestException` | `400 Bad Request` |
+| `MissingRequestHeaderException` | `400 Bad Request` |
+| `IllegalArgumentException`, `NullPointerException`, `HttpMessageNotReadableException` | `400 Bad Request` |
+| `BusinessEntityNotFoundException` | `404 Not Found` |
+| `VersionConflictException` | `409 Conflict` |
+| `BusinessRuleViolationException` | `403 Forbidden` |
+| Any other `Exception` | `500 Internal Server Error` |
+
+All error responses use the `ErrorResponse` record: `{ code, message, status, path }`.
+
+### Versioned reads
+
+Query endpoints accept an optional `?version=N` query parameter. When absent, the current version is used. This allows a client to write a command, note the returned version number, and then read back a consistent view of that exact version — without polling for projection completion.
+
+---
+
+## `supra-dispatcher-business-events-outbox-nats` — Stage 1 task builder
+
+This module implements the **first stage** of the asynchronous projection pipeline. It polls `business_event_outbox` for unclaimed events and coalesces them into `projection_tasks` by calling `BuildProjectionTasksUseCase`.
+
+**How it works:**
+
+1. A `ProjectionTaskBuilderPollingWorkerLifecycle` starts on boot and registers with the `ClaimableWorkDispatcher`.
+2. The dispatcher claims a batch of `BusinessEventEnvelope` rows from the outbox for this worker's segment.
+3. `SegmentedProjectionTaskBuilder` processes each claim by calling `BuildProjectionTasksUseCase.buildProjectionTask(command)`.
+4. Once a task is created, the event is acknowledged in the outbox.
+5. A NATS publisher (`NatsProjectionTasksReadyPublisher`) sends a wake signal so Stage 2 workers can start immediately.
+
+**NATS integration:** `NatsBusinessEventsWakeSubscriber` listens for wake signals published by the API runtime (via `infra-event-publisher-spring`). When a signal arrives, it triggers an immediate poll cycle rather than waiting for the next polling interval.
+
+**Segmentation:** Workers are partitioned by a stable hash of `potId` modulo `segment-count`. This ensures all events for the same pot are always processed by the same worker, preventing ordering races. Configure with `pocoma.projection.worker.segment-index` and `pocoma.projection.worker.segment-count`.
+
+---
+
+## `supra-dispatcher-balance-calculation-tasks-outbox-nats` — Stage 2 task executor
+
+This module implements the **second stage**: it polls `projection_tasks` and executes balance calculations by calling `ExecuteProjectionTasksUseCase`.
+
+**How it works:**
+
+1. A `SpringProjectionTaskExecutorLifecycle` starts the `ProjectionTaskExecutorWorker` on boot.
+2. The worker claims `ProjectionTask` rows from `projection_tasks` for its segment.
+3. `SegmentedProjectionTaskExecutor` processes each claim by calling `ExecuteProjectionTasksUseCase.executeProjectionTask(command)`.
+4. The use case loads projected expenses, calls `PotBalancesCalculator`, and persists the new `PotBalances`.
+5. After execution, the task is acknowledged. A NATS wake signal is published for back-pressure feedback.
+
+**NATS integration:** `NatsProjectionTasksWakeSubscriber` listens for wake signals from Stage 1. `NatsProjectionTaskProcessedPublisher` publishes a processed signal that can feed capacity-based back pressure to the API runtime.
+
+---
+
+## `supra-dispatcher-pipeline-tasks`
+
+A generic pipeline task dispatcher that uses the `orchestrator-claimable-work-dispatcher` engine to poll and dispatch configurable pipeline task types. This module provides the reusable scaffolding on top of which the NATS-specific dispatchers are built.
+
+---
+
+## `supra-dispatcher-task-materialization-nats`
+
+A NATS-backed dispatcher that drives the task materialization pipeline. It claims materializeable event records from the database via `JpaMaterializableEventSourceAdapter` and calls `MaterializeTasksUseCase` to persist the corresponding pipeline task entries. This is part of the generic pipeline task infrastructure.
+
+---
+
+## `supra-worker-balance-calculation-events-spring`
+
+This module is the **monolith-mode balance worker**. Instead of polling the database, it reacts to Spring `ApplicationEvent` notifications published in-process by `OutboxThenSpringEventPublisherAdapter`.
+
+`BalanceCalculationSpringEventListener` listens for all ten business event types (`PotCreatedEvent`, `ExpenseCreatedEvent`, etc.) and submits a `ProjectionTask` to `SegmentedBalanceCalculationWorker`, which calls `ExecuteProjectionTasksUseCase` directly.
+
+<Note>
+This worker provides low-latency balance updates in `runtime-monolith` without any NATS or database polling overhead. It is not suitable for multi-process deployments because each JVM only sees its own in-process events. Use the NATS dispatchers for distributed mode.
+</Note>
+
+---
+
+## `orchestrator-claimable-work-dispatcher`
+
+This module is the generic work-claiming engine shared by all dispatcher modules. It is not Pocoma-specific — it knows nothing about pots, expenses, or projections.
+
+**Core abstractions:**
+
+| Class | Purpose |
+|---|---|
+| `ClaimableWorkDispatcher` | Orchestrates polling, claiming, dispatching, and wake-signal handling |
+| `WakeablePollingLoop` | Polls on a timer interval but wakes immediately on a `WorkWakeEvent` |
+| `SegmentedWorkerPool` | Routes claimed work to the correct segment handler by a key hash |
+| `WorkWakeBus` | In-memory pub/sub for wake signals between components |
+| `ClaimableWorkLifecycle` | Port interface: `claim(partition)` and `acknowledge(item)` |
+| `WorkHandler` | Port interface: processes one claimed work item |
+
+All dispatchers in the supra layer configure a `ClaimableWorkDispatcher` with a concrete `ClaimableWorkLifecycle` (backed by a JPA adapter) and a `WorkHandler` (backed by an engine use case). The generic dispatcher manages segmentation, polling frequency, wake signals, and concurrency — the application-specific code only needs to provide the two pluggable components.
+
+---
+
+## When to modify this layer
+
+- **New HTTP endpoint**: add a method to the appropriate controller (`PotsCommandController`, `ExpensesCommandController`, etc.), create the request/response DTO records, add a mapping method to `RestMapper`, and wire the use case into the controller constructor.
+- **New worker type**: create a new `supra-dispatcher-*` module, implement `ClaimableWorkLifecycle` against a JPA outbox adapter, implement `WorkHandler` to call the engine use case, and configure a `ClaimableWorkDispatcher` in the Spring configuration class.
+- **Changing DTO shapes**: update the DTO records in `dto/request` or `dto/response` and the corresponding mapping in `RestMapper`. If the change is breaking, consider versioning the endpoint.
+- **Adding a new scope string**: add the new `Scope.Resource` and `Scope.Action` variants to the `Scope` class in the `domain-policy` module, then reference them in the relevant authorization policy.
+- **Changing error mappings**: update the `@ExceptionHandler` methods in `RestExceptionHandler`.
+
+For background on how the projection pipeline works end-to-end, see [projection/overview](/projection/overview). For header-based authentication details, see [api/authentication](/api/authentication).

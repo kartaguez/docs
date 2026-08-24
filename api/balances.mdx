@@ -1,0 +1,309 @@
+---
+title: "Balance Endpoints: Querying Pot and User Balances"
+sidebarTitle: "Balances"
+description: "GET /api/pots/{potId}/balances returns per-shareholder balances for a pot. GET /api/pots/balances/me lists the calling user's balance across all their pots."
+---
+
+## What Balances Represent
+
+A balance answers the question: *for a given pot, how much does each shareholder owe or is owed, relative to the total expenses recorded?*
+
+Each `BalanceResponse` entry represents one shareholder's net position in the pot:
+
+- A **positive** value means the shareholder is owed money by the group (they have paid more than their share).
+- A **negative** value means the shareholder owes money to the group (they have paid less than their share).
+- A **zero** value means the shareholder is settled.
+
+Amounts are expressed as exact fractions (`numerator / denominator`) to avoid floating-point rounding. See [Balance Field Structure](#balance-field-structure) below.
+
+---
+
+## How Balances Are Produced
+
+Balances are **projections**, not derived on-the-fly from commands. When a command (such as creating or updating an expense) completes, Pocoma writes a business event into the `business_event_outbox` table. An asynchronous pipeline then:
+
+1. Coalesces those events into `projection_tasks`.
+2. Executes each task to compute the new balance state and persist it.
+
+See [Projection Overview](/projection/overview) for architecture details.
+
+<Note>
+Because projection is asynchronous, balances may lag slightly behind the most recent commands — especially under high write load. The lag is observable via Prometheus metrics exposed at `/actuator/prometheus`. If you need to confirm that balances reflect a specific command, use the `?version=N` parameter to request balances at the exact version produced by that command.
+</Note>
+
+---
+
+## GET /api/pots/\{potId\}/balances
+
+Returns the computed balances for all shareholders in a specific pot.
+
+### Request
+
+<ParamField path="potId" type="string" required>
+  UUID of the pot. Must be a pot the calling user has access to.
+</ParamField>
+
+<ParamField query="version" type="long">
+  Optional. If provided, returns balances as of that pot version. If omitted, returns the latest projected balances.
+</ParamField>
+
+**Required headers:**
+
+| Header | Example value |
+|---|---|
+| `X-User-Id` | `22222222-2222-2222-2222-222222222222` |
+| `X-User-Scopes` | `pot:read` |
+
+### Response Body — `PotBalancesResponse`
+
+<ResponseField name="potId" type="string" required>
+  UUID of the pot these balances belong to.
+</ResponseField>
+
+<ResponseField name="version" type="long" required>
+  The pot version at which these balances were computed.
+</ResponseField>
+
+<ResponseField name="balances" type="BalanceResponse[]" required>
+  List of per-shareholder balance entries. One entry per shareholder in the pot.
+
+  <Expandable title="BalanceResponse fields">
+    <ResponseField name="shareholderId" type="string" required>
+      UUID of the shareholder this balance entry describes.
+    </ResponseField>
+
+    <ResponseField name="value" type="FractionResponse" required>
+      The net balance as an exact fraction. Positive means owed money; negative means owes money.
+
+      <Expandable title="FractionResponse fields">
+        <ResponseField name="numerator" type="long" required>
+          The numerator of the fraction.
+        </ResponseField>
+        <ResponseField name="denominator" type="long" required>
+          The denominator of the fraction. Always positive and non-zero.
+        </ResponseField>
+      </Expandable>
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+### Example
+
+**Request — latest balances:**
+
+```bash
+curl http://localhost:8080/api/pots/7a3f9e1b-0c44-4d2e-b8fa-9f1234567890/balances \
+  -H "X-User-Id: 22222222-2222-2222-2222-222222222222" \
+  -H "X-User-Scopes: pot:read"
+```
+
+**Request — balances at a specific version:**
+
+```bash
+curl "http://localhost:8080/api/pots/7a3f9e1b-0c44-4d2e-b8fa-9f1234567890/balances?version=4" \
+  -H "X-User-Id: 22222222-2222-2222-2222-222222222222" \
+  -H "X-User-Scopes: pot:read"
+```
+
+**Response:**
+
+```json
+{
+  "potId": "7a3f9e1b-0c44-4d2e-b8fa-9f1234567890",
+  "version": 4,
+  "balances": [
+    {
+      "shareholderId": "aaaa0000-0000-0000-0000-000000000001",
+      "value": {
+        "numerator": 3,
+        "denominator": 4
+      }
+    },
+    {
+      "shareholderId": "bbbb0000-0000-0000-0000-000000000002",
+      "value": {
+        "numerator": -3,
+        "denominator": 4
+      }
+    }
+  ]
+}
+```
+
+In this example, shareholder `aaaa...` is owed `3/4` of the pot's unit (they overpaid), while shareholder `bbbb...` owes `3/4` (they underpaid).
+
+---
+
+## GET /api/pots/balances/me
+
+Returns the calling user's balance across **all pots** they participate in as a shareholder. Each entry combines the pot summary with the user's own balance in that pot.
+
+<Note>
+This endpoint identifies "you" via the `X-User-Id` header. It returns balances only for pots where the calling user's ID has been linked to a shareholder via the shareholders API.
+</Note>
+
+### Request
+
+<ParamField query="version" type="long">
+  Optional. Filters results to only pots that have been projected at or beyond this version. If omitted, all pots with available projections are returned at their latest projected version.
+</ParamField>
+
+**Required headers:**
+
+| Header | Example value |
+|---|---|
+| `X-User-Id` | `22222222-2222-2222-2222-222222222222` |
+| `X-User-Scopes` | `pot:read` |
+
+### Response Body — `UserPotBalanceResponse[]`
+
+An array of `UserPotBalanceResponse` objects, one per pot in which the calling user is a shareholder.
+
+<ResponseField name="pot" type="PotResponse" required>
+  Summary of the pot.
+
+  <Expandable title="PotResponse fields">
+    <ResponseField name="id" type="string" required>
+      UUID of the pot.
+    </ResponseField>
+    <ResponseField name="label" type="string" required>
+      Human-readable name of the pot.
+    </ResponseField>
+    <ResponseField name="creatorId" type="string" required>
+      UUID of the user who created the pot.
+    </ResponseField>
+    <ResponseField name="deleted" type="boolean" required>
+      Whether the pot has been soft-deleted. Deleted pots may still appear here if balances were projected before deletion.
+    </ResponseField>
+    <ResponseField name="version" type="long" required>
+      The current version of the pot.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="shareholderId" type="string" required>
+  UUID of the shareholder record linked to the calling user in this pot.
+</ResponseField>
+
+<ResponseField name="balance" type="BalanceResponse" required>
+  The calling user's net balance in this pot.
+
+  <Expandable title="BalanceResponse fields">
+    <ResponseField name="shareholderId" type="string" required>
+      UUID of the shareholder this balance entry describes. Matches the top-level `shareholderId`.
+    </ResponseField>
+    <ResponseField name="value" type="FractionResponse" required>
+      The net balance as an exact fraction.
+
+      <Expandable title="FractionResponse fields">
+        <ResponseField name="numerator" type="long" required>
+          The numerator of the fraction.
+        </ResponseField>
+        <ResponseField name="denominator" type="long" required>
+          The denominator of the fraction. Always positive and non-zero.
+        </ResponseField>
+      </Expandable>
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="version" type="long" required>
+  The pot version at which this balance was computed.
+</ResponseField>
+
+### Example
+
+**Request — my balances across all pots:**
+
+```bash
+curl http://localhost:8080/api/pots/balances/me \
+  -H "X-User-Id: 22222222-2222-2222-2222-222222222222" \
+  -H "X-User-Scopes: pot:read"
+```
+
+**Request — my balances pinned to a specific version:**
+
+```bash
+curl "http://localhost:8080/api/pots/balances/me?version=4" \
+  -H "X-User-Id: 22222222-2222-2222-2222-222222222222" \
+  -H "X-User-Scopes: pot:read"
+```
+
+**Response:**
+
+```json
+[
+  {
+    "pot": {
+      "id": "7a3f9e1b-0c44-4d2e-b8fa-9f1234567890",
+      "label": "Trip to Barcelona",
+      "creatorId": "22222222-2222-2222-2222-222222222222",
+      "deleted": false,
+      "version": 4
+    },
+    "shareholderId": "aaaa0000-0000-0000-0000-000000000001",
+    "balance": {
+      "shareholderId": "aaaa0000-0000-0000-0000-000000000001",
+      "value": {
+        "numerator": 3,
+        "denominator": 4
+      }
+    },
+    "version": 4
+  },
+  {
+    "pot": {
+      "id": "c1b2d3e4-feed-cafe-babe-000000000099",
+      "label": "Office Lunch",
+      "creatorId": "33333333-3333-3333-3333-333333333333",
+      "deleted": false,
+      "version": 2
+    },
+    "shareholderId": "cccc0000-0000-0000-0000-000000000003",
+    "balance": {
+      "shareholderId": "cccc0000-0000-0000-0000-000000000003",
+      "value": {
+        "numerator": -1,
+        "denominator": 2
+      }
+    },
+    "version": 2
+  }
+]
+```
+
+In this response, the calling user is owed `3/4` in the Barcelona pot and owes `1/2` in the Office Lunch pot.
+
+---
+
+## Balance Field Structure
+
+### `BalanceResponse`
+
+| Field | Type | Description |
+|---|---|---|
+| `shareholderId` | `string` (UUID) | The shareholder this balance describes |
+| `value` | `FractionResponse` | Net balance as an exact fraction |
+
+### `FractionResponse`
+
+Amounts are stored and returned as exact rational numbers to prevent floating-point rounding errors when summing weighted expense shares.
+
+| Field | Type | Description |
+|---|---|---|
+| `numerator` | `long` | Numerator of the fraction |
+| `denominator` | `long` | Denominator of the fraction; always positive and non-zero |
+
+To convert to a decimal for display: `amount = numerator / denominator`.
+
+**Sign convention:**
+
+| Sign of `numerator` | Meaning |
+|---|---|
+| Positive | Shareholder is **owed** money by the group |
+| Negative | Shareholder **owes** money to the group |
+| Zero | Shareholder is fully settled |
+
+<Tip>
+When displaying balances to end users, format the fraction as a decimal rounded to 2 decimal places: `(3 / 4) → €0.75 owed` or `(-1 / 2) → €0.50 to pay`. The raw fraction is preserved in the API so downstream systems can perform further arithmetic without accumulating rounding error.
+</Tip>

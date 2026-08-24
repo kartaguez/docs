@@ -1,0 +1,226 @@
+---
+title: "Domain Layer: Pure Business Model in Pocoma"
+sidebarTitle: "Domain"
+description: "The domain module contains Pocoma's pure business entities — Pot, Shareholder, Expense, and Balance — with no Spring, JPA, or HTTP dependencies."
+---
+
+The `domain` module is Pocoma's innermost layer. It contains only plain Java: no Spring annotations, no JPA, no HTTP. Every class in this module can be instantiated and exercised in a plain JUnit test without loading any application context. This is the intentional core of the hexagonal architecture — if a new business rule needs to live somewhere, it belongs here.
+
+<Note>
+The `domain` module has **zero runtime dependencies** beyond the JDK. Adding a Spring or JPA import here is a build error, not a convention.
+</Note>
+
+---
+
+## Module layout
+
+```
+app/
+  domain/             Pure business aggregates, entities, value objects, factories
+  domain-policy/      Authorization rules checked before commands execute
+  domain-projection/  Pure, stateless balance calculation
+```
+
+---
+
+## Aggregates
+
+Aggregates are the mutable objects that carry business state. Each aggregate enforces its own invariants and throws `BusinessRuleViolationException` when a rule is broken.
+
+### `PotHeader`
+
+Represents the identity and top-level metadata of a pot.
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | `PotId` | UUID-wrapped value object |
+| `label` | `Label` | Non-null string wrapper |
+| `creatorId` | `UserId` | UUID-wrapped user identity |
+| `deleted` | `boolean` | Soft-delete flag |
+
+Key methods: `updateDetails(Label)`, `markAsDeleted()`. Both guard against mutation on a deleted pot with `assertNotDeleted()`, which throws `BusinessRuleViolationException("POT_DELETED", ...)`.
+
+Aggregates are never constructed with `new` from outside the module — they are **reconstituted** from persistence via the static factory:
+
+```java
+PotHeader pot = PotHeader.reconstitute(id, label, creatorId, false);
+```
+
+### `PotShareholders`
+
+Manages the set of `Shareholder` entities attached to a pot. Tracks which shareholders were added or updated in the current operation so that the outbound port can persist only the changed entities.
+
+Key methods: `addShareholder(Name, Weight, UserId)`, `updateShareholderDetails(ShareholderId, Name, UserId)`, `updateShareholderWeight(ShareholderId, Weight)`.
+
+Throws `BusinessRuleViolationException("SHAREHOLDER_NOT_PRESENT", ...)` when an operation targets an unknown or deleted shareholder.
+
+### `ExpenseHeader`
+
+Represents the metadata of a single expense entry within a pot.
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | `ExpenseId` | UUID-wrapped value object |
+| `potId` | `PotId` | Parent pot reference |
+| `payerId` | `ShareholderId` | Who paid |
+| `amount` | `Amount` | Non-negative fraction |
+| `label` | `Label` | Display name |
+| `deleted` | `boolean` | Soft-delete flag |
+
+Key methods: `updateDetails(ShareholderId, Amount, Label)`, `markAsDeleted()`.
+
+### `ExpenseShares`
+
+Holds the per-shareholder weight distribution for one expense. On `updateExpenseShares`, the aggregate validates that every referenced `ShareholderId` exists in the pot's current shareholder set; unknown shareholders cause `BusinessRuleViolationException("SHAREHOLDER_NOT_PRESENT", ...)`. Duplicate share entries for the same shareholder are merged by summing their `Weight` values.
+
+---
+
+## Entities
+
+### `Shareholder`
+
+Immutable value-like entity within a pot.
+
+```java
+public final class Shareholder {
+    private final ShareholderId id;
+    private final PotId potId;
+    private final Name name;
+    private final Weight weight;
+    private final UserId userId;   // nullable — shareholder may not be a platform user
+    private final boolean deleted;
+}
+```
+
+`userId` is nullable: a shareholder can represent a real-world person who is not a registered user of the platform. When the shareholder is linked to a user account, `userId` is set via `updateShareholderDetails`.
+
+---
+
+## Value objects
+
+Value objects carry validated, immutable data. All live under `com.kartaguez.pocoma.domain.value`.
+
+| Class | Wraps | Constraint |
+|---|---|---|
+| `PotId` | `UUID` | extends `EntityId` |
+| `ShareholderId` | `UUID` | extends `EntityId` |
+| `ExpenseId` | `UUID` | extends `EntityId` |
+| `UserId` | `UUID` | — |
+| `Amount` | `Fraction` | non-negative |
+| `Weight` | `Fraction` | non-negative |
+| `Label` | `String` | non-null |
+| `Name` | `String` | non-null |
+| `Fraction` | `long numerator, long denominator` | auto-reduced by GCD; supports exact arithmetic |
+
+`Fraction` is the core arithmetic type. It stores amounts and weights as exact rationals (e.g. `Fraction.of(1, 3)` for one-third) and supports `add`, `subtract`, `multiply`, `divide`, and `compareTo` without floating-point rounding.
+
+```java
+// Exact arithmetic: 1/3 + 1/6 = 1/2
+Fraction third = Fraction.of(1, 3);
+Fraction sixth = Fraction.of(1, 6);
+Fraction half  = third.add(sixth);   // Fraction(1, 2)
+```
+
+### Association: `ExpenseShare`
+
+A record linking one expense to one shareholder with a relative `Weight`:
+
+```java
+public record ExpenseShare(ExpenseId expenseId, ShareholderId shareholderId, Weight weight) {}
+```
+
+---
+
+## Domain-policy module
+
+The `domain-policy` module contains authorization rules. These are plain Java classes with no Spring context. Each policy has a single `assertCan…` method that throws `BusinessRuleViolationException` on failure. Engine services call these policies **after** loading context but **before** persisting anything.
+
+<CardGroup cols={2}>
+  <Card title="CreatePotAuthorizationPolicy" icon="circle-plus">
+    Requires a non-null `userId` and the `pot:create` scope.
+  </Card>
+  <Card title="ReadPotAuthorizationPolicy" icon="eye">
+    Requires authentication plus membership (creator or shareholder) and `pot:read` scope. Also used for listing all accessible pots via `assertCanListReadablePots`.
+  </Card>
+  <Card title="DeletePotAuthorizationPolicy" icon="trash">
+    Only the **creator** may delete a pot. Requires `pot:delete` scope.
+  </Card>
+  <Card title="UpdatePotDetailsAuthorizationPolicy" icon="pen">
+    Only the creator may update pot details. Requires `pot:update` scope.
+  </Card>
+  <Card title="AddPotShareholdersAuthorizationPolicy" icon="user-plus">
+    Only the creator may add shareholders. Requires `shareholder:create` scope.
+  </Card>
+  <Card title="UpdatePotShareholdersDetailsAuthorizationPolicy" icon="address-card">
+    Only the creator may update shareholder details.
+  </Card>
+  <Card title="UpdatePotShareholdersWeightsAuthorizationPolicy" icon="sliders">
+    Only the creator may update shareholder weights.
+  </Card>
+  <Card title="CreateExpenseAuthorizationPolicy" icon="receipt">
+    The creator **or any shareholder** may create an expense. Requires `expense:create` scope.
+  </Card>
+  <Card title="UpdateExpenseDetailsAuthorizationPolicy" icon="file-pen">
+    Creator or shareholder only; requires `expense:update` scope.
+  </Card>
+  <Card title="UpdateExpenseSharesAuthorizationPolicy" icon="chart-pie">
+    Creator or shareholder only; requires `expense:update` scope.
+  </Card>
+  <Card title="DeleteExpenseAuthorizationPolicy" icon="trash-can">
+    Creator or shareholder only; requires `expense:delete` scope.
+  </Card>
+</CardGroup>
+
+<Note>
+Policy rules contain `TODO` comments marking the intended future access-control model: `userId in shareholders.userId && userScopes.contains(pot:create)`. Today the scope set is constructed from the `X-User-Scopes` header by the supra layer and passed through `UserContext`.
+</Note>
+
+---
+
+## Domain-projection module
+
+The `domain-projection` module contains `PotBalancesCalculator` — a pure, deterministic, stateless class that computes per-shareholder balances from a set of expenses. It depends only on `domain` types and carries no I/O.
+
+### How it works
+
+`PotBalancesCalculator.calculate(previousBalances, targetVersion, activeAtPreviousOnly, activeAtTargetOnly)` applies an **incremental diff**:
+
+1. Compute the balance contribution of expenses that were **active at the previous version but no longer active** at the target version (expenses that were deleted in between). Subtract these contributions from `previousBalances`.
+2. Compute the balance contribution of expenses that are **newly active** at the target version. Add these to the result.
+
+For each expense, the payer's balance is credited by the full `amount`. Each shareholder's balance is then debited by `amount × (shareholder_weight / total_weight)` using exact `Fraction` arithmetic.
+
+```java
+// Simplified balance contribution for one expense
+Fraction totalWeight = shares.values().stream()
+    .map(s -> s.weight().value())
+    .reduce(Fraction.ZERO, Fraction::add);
+
+// Payer receives credit for the full amount
+put(result, header.payerId(), header.amount().value());
+
+// Each shareholder is debited their proportional share
+shares.values().forEach(share -> {
+    Fraction debit = header.amount().value()
+        .multiply(share.weight().value())
+        .divide(totalWeight)
+        .negate();
+    put(result, share.shareholderId(), current.add(debit));
+});
+```
+
+`PotBalances` is a record holding `(PotId potId, long version, Map<ShareholderId, Balance> balances)`. `Balance` is a record holding `(ShareholderId shareholderId, Fraction value)` — positive means the shareholder is owed money, negative means they owe.
+
+<Tip>
+Because `PotBalancesCalculator` is stateless and pure, it can be unit-tested with hand-crafted `ProjectedExpense` objects and no database. The engine tests do exactly this.
+</Tip>
+
+---
+
+## When to modify this layer
+
+- **New business rule on an aggregate** (e.g. cap on the number of shareholders): add an assertion in the relevant aggregate method and throw `BusinessRuleViolationException`.
+- **New entity field** (e.g. a `currency` on `ExpenseHeader`): add the field to the aggregate and value objects, then update the `reconstitute` factory and the JPA entity in `infra-persistence-jpa`.
+- **New value object**: create a class under `domain/value`, wrapping the primitive with validation in the constructor.
+- **New authorization rule**: add a method to the relevant policy class in `domain-policy`, or create a new policy class and wire it into the engine service in `engine-command`.
+- **Changing the balance algorithm**: edit `PotBalancesCalculator` in `domain-projection`. The change takes effect for all future projection executions; historical projection tasks will recompute with the new formula.

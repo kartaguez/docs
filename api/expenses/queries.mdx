@@ -1,0 +1,183 @@
+---
+title: "Expense Query Endpoints: Get Expense Details"
+sidebarTitle: "Expense Queries"
+description: "REST endpoints for reading expense state: GET /api/expenses/{expenseId} returns the expense details and its weighted share breakdown."
+---
+
+This page documents the read-only query endpoints under `/api/expenses`. These endpoints never modify state and can safely be retried.
+
+## Headers
+
+| Header | Required | Description |
+|---|---|---|
+| `X-User-Id` | **Required** | UUID of the calling user. Must be a valid UUID. |
+| `X-User-Scopes` | **Required** | Semicolon-separated scopes. Expense reads require `pot:read`. |
+
+---
+
+## `GET /api/expenses/{expenseId}` — Get an expense
+
+Returns the full view of a single expense, combining the expense header (payer, amount, label) with the complete per-shareholder share breakdown. Returns `200 OK` on success.
+
+**Required scope:** `pot:read`
+
+### Path parameters
+
+<ParamField path="expenseId" type="string" required>
+  UUID of the expense to retrieve.
+</ParamField>
+
+### Query parameters
+
+<ParamField query="version" type="integer">
+  Optional. When provided, returns the expense state as it was at that event-log version, enabling historical reads. Omit to retrieve the latest state.
+</ParamField>
+
+<Note>
+  The version parameter follows the **pot's** shared event log version — the same counter that
+  advances for every command on the pot and its expenses. Supplying `?version=5` returns the
+  expense as it existed just after version 5 was recorded. If the expense did not yet exist at
+  that version the server returns a `404 Not Found`.
+</Note>
+
+### Response body
+
+<ResponseField name="header" type="object">
+  Core expense metadata.
+  <Expandable title="ExpenseHeaderResponse">
+    <ResponseField name="id" type="string">UUID of the expense.</ResponseField>
+    <ResponseField name="potId" type="string">UUID of the pot this expense belongs to.</ResponseField>
+    <ResponseField name="payerId" type="string">UUID of the shareholder who paid the expense.</ResponseField>
+    <ResponseField name="amount" type="object">
+      Expense amount expressed as a fraction.
+      <Expandable title="FractionResponse">
+        <ResponseField name="numerator" type="integer">
+          Numerator of the amount fraction. For a whole number amount (e.g., €42) this is `42`.
+        </ResponseField>
+        <ResponseField name="denominator" type="integer">
+          Denominator of the amount fraction. For a whole number amount this is `1`.
+        </ResponseField>
+      </Expandable>
+    </ResponseField>
+    <ResponseField name="label" type="string">Human-readable description of the expense.</ResponseField>
+    <ResponseField name="deleted" type="boolean">
+      `true` if the expense has been soft-deleted. Deleted expenses are still retrievable for
+      audit and historical balance purposes.
+    </ResponseField>
+    <ResponseField name="version" type="integer">
+      Version of the event log at which this expense header was last modified.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="shares" type="object">
+  Share breakdown — how the expense is divided among shareholders.
+  <Expandable title="ExpenseSharesResponse">
+    <ResponseField name="expenseId" type="string">UUID of the expense (mirrors `header.id`).</ResponseField>
+    <ResponseField name="potId" type="string">UUID of the owning pot.</ResponseField>
+    <ResponseField name="shares" type="array">
+      List of per-shareholder share allocations.
+      <Expandable title="ExpenseShareResponse">
+        <ResponseField name="shareholderId" type="string">
+          UUID of the shareholder who has this portion of the expense.
+        </ResponseField>
+        <ResponseField name="weight" type="object">
+          This shareholder's fractional weight for this expense.
+          <Expandable title="FractionResponse">
+            <ResponseField name="numerator" type="integer">Numerator of the weight fraction.</ResponseField>
+            <ResponseField name="denominator" type="integer">Denominator of the weight fraction.</ResponseField>
+          </Expandable>
+        </ResponseField>
+      </Expandable>
+    </ResponseField>
+    <ResponseField name="version" type="integer">Version at which the shares were last modified.</ResponseField>
+  </Expandable>
+</ResponseField>
+
+<Tip>
+  The `shares[].weight` fractions describe the **relative proportions** of the expense
+  attributed to each shareholder, not absolute monetary amounts. To calculate the actual
+  amount owed by a shareholder, compute:
+
+  ```
+  shareholder_amount = (header.amount.numerator / header.amount.denominator)
+                     * (share.weight.numerator  / share.weight.denominator)
+                     / sum_of_all_share_weights
+  ```
+</Tip>
+
+### Example — current state
+
+```bash
+curl http://localhost:8080/api/expenses/cccccccc-cccc-cccc-cccc-cccccccccccc \
+  -H "X-User-Id: 22222222-2222-2222-2222-222222222222" \
+  -H "X-User-Scopes: pot:read"
+```
+
+```json
+{
+  "header": {
+    "id": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+    "potId": "550e8400-e29b-41d4-a716-446655440000",
+    "payerId": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+    "amount": { "numerator": 84, "denominator": 1 },
+    "label": "Lunch (updated)",
+    "deleted": false,
+    "version": 8
+  },
+  "shares": {
+    "expenseId": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+    "potId": "550e8400-e29b-41d4-a716-446655440000",
+    "shares": [
+      {
+        "shareholderId": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        "weight": { "numerator": 2, "denominator": 3 }
+      },
+      {
+        "shareholderId": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        "weight": { "numerator": 1, "denominator": 3 }
+      }
+    ],
+    "version": 8
+  }
+}
+```
+
+### Example — historical read at version 6
+
+Retrieve the expense as it looked at version 6 (immediately after it was first created with a 50/50 split):
+
+```bash
+curl "http://localhost:8080/api/expenses/cccccccc-cccc-cccc-cccc-cccccccccccc?version=6" \
+  -H "X-User-Id: 22222222-2222-2222-2222-222222222222" \
+  -H "X-User-Scopes: pot:read"
+```
+
+```json
+{
+  "header": {
+    "id": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+    "potId": "550e8400-e29b-41d4-a716-446655440000",
+    "payerId": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+    "amount": { "numerator": 42, "denominator": 1 },
+    "label": "Lunch",
+    "deleted": false,
+    "version": 6
+  },
+  "shares": {
+    "expenseId": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+    "potId": "550e8400-e29b-41d4-a716-446655440000",
+    "shares": [
+      {
+        "shareholderId": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        "weight": { "numerator": 1, "denominator": 2 }
+      },
+      {
+        "shareholderId": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        "weight": { "numerator": 1, "denominator": 2 }
+      }
+    ],
+    "version": 6
+  }
+}
+```
